@@ -1,0 +1,173 @@
+-- quarry_service.lua
+-- Run on ONE dedicated turtle whose only job is to shuttle between the
+-- mining turtles, draining their mined blocks and delivering fuel, so the
+-- mining turtles don't need their own chests.
+--
+-- SETUP:
+--   * Place this turtle ONE block to the LEFT of turtle 0 (i.e. stand
+--     behind the row of mining turtles, facing the same direction they'll
+--     tunnel -- the service turtle goes immediately to lane 0's left).
+--     It must face the SAME direction as the mining fleet.
+--   * Put ONE chest directly BEHIND it -- pre-load it with fuel
+--     (coal/charcoal/lava buckets/etc). Mined blocks collected from every
+--     turtle in the fleet get dumped back into this same chest.
+--   * Attach a wireless modem.
+--   * Run: quarry_service
+--   * (If it seems to be reaching for the wrong lane, it was placed on the
+--     wrong side of the row -- move it to the other end and try again.)
+
+local PROTOCOL = "chunkservice"
+
+for _, side in ipairs(peripheral.getNames()) do
+  if peripheral.getType(side) == "modem" then
+    rednet.open(side)
+  end
+end
+
+local FUEL_SLOT = 16
+local FUEL_BATCH = 4            -- fuel items delivered per service visit (tune to your fuel type)
+local FUEL_RESERVE_TARGET = 2000
+local HOME_FUEL_MIN = 300
+
+-- full 2-axis position tracking: sx = along the row (lanes), sz = into the tunnel
+local sx, sz, facing = 0, 0, 0 -- facing: 0=+z(tunnel dir) 1=+x(along row) 2=-z 3=-x
+
+local function turnRight()
+  turtle.turnRight()
+  facing = (facing + 1) % 4
+end
+
+local function face(dir)
+  while facing ~= dir do turnRight() end
+end
+
+local function tryMove(moveFn, digFn, detectFn)
+  local attempts = 0
+  while not moveFn() do
+    attempts = attempts + 1
+    if detectFn() then digFn() else turtle.attack() end
+    sleep(0.4)
+    if attempts > 40 then return false end
+  end
+  return true
+end
+
+local function forward()
+  if tryMove(turtle.forward, turtle.dig, turtle.detect) then
+    if facing == 0 then sz = sz + 1
+    elseif facing == 1 then sx = sx + 1
+    elseif facing == 2 then sz = sz - 1
+    else sx = sx - 1 end
+    return true
+  end
+  return false
+end
+
+local function goToX(target)
+  if sx < target then face(1) else face(3) end
+  while sx ~= target do
+    if not forward() then break end
+  end
+end
+
+local function goToZ(target)
+  if sz < target then face(0) else face(2) end
+  while sz ~= target do
+    if not forward() then break end
+  end
+end
+
+local function inventoryFull()
+  for i = 1, 15 do
+    if turtle.getItemCount(i) == 0 then return false end
+  end
+  return true
+end
+
+-- All lane changes (X moves) happen only at sz=0, and all depth moves (Z)
+-- happen within one lane's own already-dug tunnel, so nothing here ever
+-- needs to dig through an unbroken wall.
+local function goHomeAndService()
+  local rx, rz = sx, sz
+  goToZ(0)
+  goToX(0)
+  face(2) -- home chest is directly behind the start position
+  for i = 1, 15 do
+    turtle.select(i)
+    turtle.drop()
+  end
+  turtle.select(FUEL_SLOT)
+  turtle.refuel()
+  while turtle.getFuelLevel() ~= "unlimited" and turtle.getFuelLevel() < FUEL_RESERVE_TARGET do
+    local before = turtle.getItemCount(FUEL_SLOT)
+    turtle.suck()
+    if turtle.getItemCount(FUEL_SLOT) == before then break end
+    if not turtle.refuel() then break end
+  end
+  turtle.select(1)
+  goToX(rx)
+  goToZ(rz)
+end
+
+local function checkSelf()
+  local level = turtle.getFuelLevel()
+  if inventoryFull() or (level ~= "unlimited" and level < HOME_FUEL_MIN) then
+    goHomeAndService()
+  end
+end
+
+-- laneId's dock sits at physical row-offset (laneId + 1) from this turtle's
+-- own start (it's placed one block to the left of lane 0).
+local function service(laneId, zb)
+  checkSelf()
+  goToZ(0)
+  goToX(laneId + 1)
+  goToZ(zb - 1)
+  face(0)
+
+  for i = 1, 20 do
+    if not turtle.suck() then break end
+    if inventoryFull() then
+      goToZ(0)
+      goToX(0)
+      checkSelf()
+      goToX(laneId + 1)
+      goToZ(zb - 1)
+      face(0)
+    end
+  end
+
+  turtle.select(FUEL_SLOT)
+  turtle.drop(FUEL_BATCH)
+  turtle.select(1)
+
+  rednet.broadcast({ cmd = "serviced", id = laneId }, PROTOCOL)
+
+  goToZ(0)
+end
+
+print("Service turtle ready. Waiting for requests...")
+
+local pending = {}
+local queueOrder = {}
+
+while true do
+  local senderId, msg = rednet.receive(PROTOCOL, 2)
+  if msg and msg.cmd == "service_request" then
+    if not pending[msg.id] then
+      table.insert(queueOrder, msg.id)
+    end
+    pending[msg.id] = msg.z
+  elseif msg and msg.cmd == "stop" then
+    break
+  end
+
+  while #queueOrder > 0 do
+    local laneId = table.remove(queueOrder, 1)
+    local zb = pending[laneId]
+    pending[laneId] = nil
+    service(laneId, zb)
+  end
+end
+
+print("Service turtle stopped.")
