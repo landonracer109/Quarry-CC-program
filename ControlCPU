@@ -1,173 +1,152 @@
--- quarry_service.lua
--- Run on ONE dedicated turtle whose only job is to shuttle between the
--- mining turtles, draining their mined blocks and delivering fuel, so the
--- mining turtles don't need their own chests.
---
--- SETUP:
---   * Place this turtle ONE block to the LEFT of turtle 0 (i.e. stand
---     behind the row of mining turtles, facing the same direction they'll
---     tunnel -- the service turtle goes immediately to lane 0's left).
---     It must face the SAME direction as the mining fleet.
---   * Put ONE chest directly BEHIND it -- pre-load it with fuel
---     (coal/charcoal/lava buckets/etc). Mined blocks collected from every
---     turtle in the fleet get dumped back into this same chest.
---   * Attach a wireless modem.
---   * Run: quarry_service
---   * (If it seems to be reaching for the wrong lane, it was placed on the
---     wrong side of the row -- move it to the other end and try again.)
+-- quarry_control.lua
+-- Runs on a Computer (NOT a turtle) with a wireless modem attached.
+-- Coordinates a fleet of turtles (running quarry_turtle.lua) to mine
+-- chunk after chunk in a line: all turtles mine one chunk together,
+-- then all advance to the next chunk together.
 
-local PROTOCOL = "chunkservice"
+local PROTOCOL = "chunkquarry"
 
+local opened = false
 for _, side in ipairs(peripheral.getNames()) do
   if peripheral.getType(side) == "modem" then
     rednet.open(side)
+    opened = true
   end
 end
-
-local FUEL_SLOT = 16
-local FUEL_BATCH = 4            -- fuel items delivered per service visit (tune to your fuel type)
-local FUEL_RESERVE_TARGET = 2000
-local HOME_FUEL_MIN = 300
-
--- full 2-axis position tracking: sx = along the row (lanes), sz = into the tunnel
-local sx, sz, facing = 0, 0, 0 -- facing: 0=+z(tunnel dir) 1=+x(along row) 2=-z 3=-x
-
-local function turnRight()
-  turtle.turnRight()
-  facing = (facing + 1) % 4
+if not opened then
+  error("No modem attached to this computer! Attach a wireless modem and rerun.")
 end
 
-local function face(dir)
-  while facing ~= dir do turnRight() end
+print("=== Chunk Quarry Control ===")
+io.write("Chunk length (blocks per tunnel, usually 16): ")
+local length = tonumber(read()) or 16
+io.write("Depth (layers to mine down): ")
+local depth = tonumber(read()) or 60
+io.write("Number of chunks to mine (0 = run until stopped): ")
+local chunks = tonumber(read()) or 0
+
+local turtles = {} -- [laneId] = {computerId=, status=, chunk=, fuel=}
+
+local function countTurtles()
+  local n = 0
+  for _ in pairs(turtles) do n = n + 1 end
+  return n
 end
 
-local function tryMove(moveFn, digFn, detectFn)
-  local attempts = 0
-  while not moveFn() do
-    attempts = attempts + 1
-    if detectFn() then digFn() else turtle.attack() end
-    sleep(0.4)
-    if attempts > 40 then return false end
+local function draw(headerExtra)
+  term.clear()
+  term.setCursorPos(1, 1)
+  print("=== Chunk Quarry Control ===")
+  print("length=" .. length .. "  depth=" .. depth .. "  chunks=" .. (chunks == 0 and "infinite" or chunks))
+  print(string.rep("-", 50))
+  local ids = {}
+  for id in pairs(turtles) do table.insert(ids, id) end
+  table.sort(ids)
+  for _, id in ipairs(ids) do
+    local t = turtles[id]
+    print(string.format("Turtle %2d | chunk %3d | fuel %6s | %s",
+      id, t.chunk or 0, tostring(t.fuel or "?"), t.status or ""))
   end
-  return true
+  print(string.rep("-", 50))
+  if headerExtra then print(headerExtra) end
 end
 
-local function forward()
-  if tryMove(turtle.forward, turtle.dig, turtle.detect) then
-    if facing == 0 then sz = sz + 1
-    elseif facing == 1 then sx = sx + 1
-    elseif facing == 2 then sz = sz - 1
-    else sx = sx - 1 end
-    return true
+-- Phase 1: collect registrations
+draw("Power on turtles now (run: quarry_turtle <laneId> on each).")
+print("Press ENTER once all expected turtles have checked in.")
+
+local collecting = true
+parallel.waitForAny(
+  function()
+    while collecting do
+      local senderId, msg = rednet.receive(PROTOCOL, 1)
+      if msg and msg.cmd == "hello" then
+        turtles[msg.id] = turtles[msg.id] or {}
+        turtles[msg.id].computerId = senderId
+        turtles[msg.id].status = "ready"
+        draw("Press ENTER once all expected turtles have checked in.")
+      end
+    end
+  end,
+  function()
+    read()
+    collecting = false
   end
-  return false
+)
+
+if countTurtles() == 0 then
+  print("No turtles checked in. Exiting.")
+  return
 end
 
-local function goToX(target)
-  if sx < target then face(1) else face(3) end
-  while sx ~= target do
-    if not forward() then break end
-  end
+-- Phase 2: send start config to every registered turtle
+for id, t in pairs(turtles) do
+  rednet.send(t.computerId, { cmd = "start", length = length, depth = depth, chunks = chunks }, PROTOCOL)
+  t.status = "starting"
 end
 
-local function goToZ(target)
-  if sz < target then face(0) else face(2) end
-  while sz ~= target do
-    if not forward() then break end
-  end
-end
+-- Phase 3: monitor, advance chunks, allow early stop
+local currentChunk = 1
+local doneThisChunk = {}
+local running = true
 
-local function inventoryFull()
-  for i = 1, 15 do
-    if turtle.getItemCount(i) == 0 then return false end
-  end
-  return true
-end
+parallel.waitForAny(
+  function()
+    while running do
+      local senderId, msg = rednet.receive(PROTOCOL, 2)
+      if msg then
+        -- allow late-joining turtles too
+        turtles[msg.id] = turtles[msg.id] or { status = "ready" }
+        local t = turtles[msg.id]
+        t.computerId = senderId
 
--- All lane changes (X moves) happen only at sz=0, and all depth moves (Z)
--- happen within one lane's own already-dug tunnel, so nothing here ever
--- needs to dig through an unbroken wall.
-local function goHomeAndService()
-  local rx, rz = sx, sz
-  goToZ(0)
-  goToX(0)
-  face(2) -- home chest is directly behind the start position
-  for i = 1, 15 do
-    turtle.select(i)
-    turtle.drop()
-  end
-  turtle.select(FUEL_SLOT)
-  turtle.refuel()
-  while turtle.getFuelLevel() ~= "unlimited" and turtle.getFuelLevel() < FUEL_RESERVE_TARGET do
-    local before = turtle.getItemCount(FUEL_SLOT)
-    turtle.suck()
-    if turtle.getItemCount(FUEL_SLOT) == before then break end
-    if not turtle.refuel() then break end
-  end
-  turtle.select(1)
-  goToX(rx)
-  goToZ(rz)
-end
+        if msg.cmd == "progress" then
+          t.chunk = msg.chunk
+          t.fuel = msg.fuel
+          t.status = "mining layer " .. tostring(msg.layer)
+        elseif msg.cmd == "chunk_done" then
+          t.status = "chunk " .. msg.chunk .. " done, waiting"
+          doneThisChunk[msg.id] = msg.chunk
+        elseif msg.cmd == "error" then
+          t.status = "ERROR: " .. tostring(msg.msg)
+        end
+      end
 
-local function checkSelf()
-  local level = turtle.getFuelLevel()
-  if inventoryFull() or (level ~= "unlimited" and level < HOME_FUEL_MIN) then
-    goHomeAndService()
-  end
-end
+      local allDone, count = true, 0
+      for id in pairs(turtles) do
+        count = count + 1
+        if doneThisChunk[id] ~= currentChunk then allDone = false end
+      end
 
--- laneId's dock sits at physical row-offset (laneId + 1) from this turtle's
--- own start (it's placed one block to the left of lane 0).
-local function service(laneId, zb)
-  checkSelf()
-  goToZ(0)
-  goToX(laneId + 1)
-  goToZ(zb - 1)
-  face(0)
+      if allDone and count > 0 then
+        if chunks ~= 0 and currentChunk >= chunks then
+          for id, t in pairs(turtles) do
+            rednet.send(t.computerId, { cmd = "stop" }, PROTOCOL)
+          end
+          running = false
+        else
+          for id, t in pairs(turtles) do
+            rednet.send(t.computerId, { cmd = "next_chunk" }, PROTOCOL)
+            t.status = "advancing to chunk " .. (currentChunk + 1)
+          end
+          currentChunk = currentChunk + 1
+        end
+      end
 
-  for i = 1, 20 do
-    if not turtle.suck() then break end
-    if inventoryFull() then
-      goToZ(0)
-      goToX(0)
-      checkSelf()
-      goToX(laneId + 1)
-      goToZ(zb - 1)
-      face(0)
+      draw("Chunk " .. currentChunk .. " in progress. Type 's' + ENTER to stop early.")
+    end
+  end,
+  function()
+    while running do
+      local line = read()
+      if line == "s" then
+        for id, t in pairs(turtles) do
+          rednet.send(t.computerId, { cmd = "stop" }, PROTOCOL)
+        end
+        running = false
+      end
     end
   end
+)
 
-  turtle.select(FUEL_SLOT)
-  turtle.drop(FUEL_BATCH)
-  turtle.select(1)
-
-  rednet.broadcast({ cmd = "serviced", id = laneId }, PROTOCOL)
-
-  goToZ(0)
-end
-
-print("Service turtle ready. Waiting for requests...")
-
-local pending = {}
-local queueOrder = {}
-
-while true do
-  local senderId, msg = rednet.receive(PROTOCOL, 2)
-  if msg and msg.cmd == "service_request" then
-    if not pending[msg.id] then
-      table.insert(queueOrder, msg.id)
-    end
-    pending[msg.id] = msg.z
-  elseif msg and msg.cmd == "stop" then
-    break
-  end
-
-  while #queueOrder > 0 do
-    local laneId = table.remove(queueOrder, 1)
-    local zb = pending[laneId]
-    pending[laneId] = nil
-    service(laneId, zb)
-  end
-end
-
-print("Service turtle stopped.")
+draw("All done / stopped.")
