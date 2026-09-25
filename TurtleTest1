@@ -1,0 +1,241 @@
+-- quarry_turtle.lua
+-- Run on each mining turtle: quarry_turtle <laneId>
+-- Waits for commands from the control computer over rednet, mines its own
+-- single-wide lane one chunk (length x depth) at a time, and calls the
+-- service turtle over (instead of using its own chest) whenever it needs
+-- to dump ore or get fuel.
+--
+-- SETUP (per turtle):
+--   * Place it facing the direction the whole fleet will tunnel.
+--   * NO chest needed behind it anymore -- the service turtle handles that.
+--   * Attach a wireless modem to the turtle (any side).
+--   * Put a stack of Spot Loaders in slot 15 -- the turtle places one
+--     (facing up, out of the tunnel's way) at the start of every new chunk
+--     so that chunk stays loaded while it works.
+--   * Line up all 16 turtles side by side, 1 block apart, all facing the
+--     same way.
+--   * Also set up quarry_service.lua on a dedicated service turtle (see
+--     that file's header for placement) and a proper Chunk Loader at
+--     home base covering the control computer + service turtle's chest.
+
+local args = { ... }
+local laneId = tonumber(args[1])
+if not laneId then
+  print("Usage: quarry_turtle <laneId>")
+  return
+end
+
+local PROTOCOL = "chunkquarry"         -- control computer <-> mining turtles
+local SERVICE_PROTOCOL = "chunkservice" -- mining turtles <-> service turtle
+
+for _, side in ipairs(peripheral.getNames()) do
+  if peripheral.getType(side) == "modem" then
+    rednet.open(side)
+  end
+end
+
+local LOADER_SLOT = 15
+local FUEL_BUFFER = 15
+
+-- Each turtle only ever occupies its own single-wide lane, so we only
+-- need to track how far forward (z) and how deep (y) it's gone.
+local y, z, facing = 0, 0, 0 -- facing: 0 = mining direction (+z), 2 = opposite (-z)
+
+local function turnAround()
+  turtle.turnRight()
+  turtle.turnRight()
+end
+
+local function face(dir)
+  if facing ~= dir then
+    turnAround()
+    facing = dir
+  end
+end
+
+local function tryMove(moveFn, digFn, detectFn)
+  local attempts = 0
+  while not moveFn() do
+    attempts = attempts + 1
+    if detectFn() then digFn() else turtle.attack() end
+    sleep(0.4)
+    if attempts > 40 then return false end
+  end
+  return true
+end
+
+local function forward()
+  face(0)
+  if tryMove(turtle.forward, turtle.dig, turtle.detect) then
+    z = z + 1
+    return true
+  end
+  return false
+end
+
+local function back()
+  face(2)
+  if tryMove(turtle.forward, turtle.dig, turtle.detect) then
+    z = z - 1
+    return true
+  end
+  return false
+end
+
+local function up()
+  if tryMove(turtle.up, turtle.digUp, turtle.detectUp) then
+    y = y + 1
+    return true
+  end
+  return false
+end
+
+local function down()
+  if tryMove(turtle.down, turtle.digDown, turtle.detectDown) then
+    y = y - 1
+    return true
+  end
+  return false
+end
+
+local function goToY(target)
+  while y < target do if not up() then break end end
+  while y > target do if not down() then break end end
+end
+
+local function goToZ(target)
+  while z < target do if not forward() then break end end
+  while z > target do if not back() then break end end
+end
+
+local function inventoryFull()
+  for i = 1, 14 do -- leave slot 15 (loaders) out of this check
+    if turtle.getItemCount(i) == 0 then return false end
+  end
+  return true
+end
+
+local zBase = 0 -- current chunk's start depth (set/updated in the main loop below)
+
+-- Walks back to this chunk's own entrance, calls the service turtle over,
+-- waits for it to drain/refuel, then walks back to where it left off.
+local function requestServiceAndWait()
+  local rz, ry = z, y
+  goToY(0)
+  goToZ(zBase)
+  face(0) -- service turtle approaches from behind, through the tunnel
+
+  rednet.broadcast({ cmd = "service_request", id = laneId, z = zBase }, SERVICE_PROTOCOL)
+
+  local serviced = false
+  while not serviced do
+    local senderId, msg = rednet.receive(SERVICE_PROTOCOL, 10)
+    if msg and msg.cmd == "serviced" and msg.id == laneId then
+      serviced = true
+    elseif not msg then
+      -- no reply yet, nudge the request again in case it got missed
+      rednet.broadcast({ cmd = "service_request", id = laneId, z = zBase }, SERVICE_PROTOCOL)
+    end
+  end
+
+  -- consume whatever fuel the service turtle dropped off
+  for i = 1, 16 do
+    if i ~= LOADER_SLOT then
+      turtle.select(i)
+      turtle.refuel()
+    end
+  end
+  turtle.select(1)
+
+  goToZ(rz)
+  goToY(ry)
+end
+
+local function fuelNeeded()
+  return (z - zBase) + math.abs(y) + FUEL_BUFFER
+end
+
+local function ensureOkToContinue()
+  local level = turtle.getFuelLevel()
+  if (level ~= "unlimited" and level < fuelNeeded()) or inventoryFull() then
+    requestServiceAndWait()
+  end
+end
+
+local function placeChunkLoader()
+  turtle.select(LOADER_SLOT)
+  if turtle.getItemCount(LOADER_SLOT) > 0 then
+    turtle.placeUp() -- stays clear of the tunnel below
+  end
+  turtle.select(1)
+end
+
+local function report(msg)
+  rednet.broadcast(msg, PROTOCOL)
+end
+
+-- register with control computer
+report({ cmd = "hello", id = laneId })
+
+local function waitFor(cmdName)
+  while true do
+    local senderId, msg = rednet.receive(PROTOCOL, 5)
+    if msg and msg.cmd == cmdName then return senderId, msg end
+    if msg and msg.cmd == "stop" then return nil, nil end
+  end
+end
+
+local senderId, cfg = waitFor("start")
+if not cfg then return end
+
+local length = cfg.length
+local depth = cfg.depth
+local maxChunks = cfg.chunks -- 0 = infinite
+
+ensureOkToContinue() -- get initial fuel even if starting at zero
+
+local function mineToZ(target, chunkNum, layer)
+  while z ~= target do
+    ensureOkToContinue()
+    local moved = (z < target) and forward() or back()
+    if not moved then break end
+    report({ cmd = "progress", id = laneId, chunk = chunkNum, layer = layer, fuel = turtle.getFuelLevel() })
+  end
+end
+
+local chunkNum = 1
+
+while true do
+  ensureOkToContinue()
+  placeChunkLoader()
+
+  for layer = 0, depth - 1 do
+    local target = (layer % 2 == 0) and (zBase + length - 1) or zBase
+    mineToZ(target, chunkNum, layer)
+    if layer < depth - 1 then
+      if not down() then break end
+    end
+  end
+
+  goToZ(zBase)
+  goToY(0)
+  report({ cmd = "chunk_done", id = laneId, chunk = chunkNum })
+
+  if maxChunks ~= 0 and chunkNum >= maxChunks then
+    break
+  end
+
+  local sid, msg
+  while true do
+    sid, msg = rednet.receive(PROTOCOL, 5)
+    if msg and msg.cmd == "next_chunk" then break end
+    if msg and msg.cmd == "stop" then return end
+  end
+
+  zBase = zBase + length
+  chunkNum = chunkNum + 1
+  ensureOkToContinue()
+  goToZ(zBase) -- tunnel forward at the surface to the next chunk's start
+end
+
+print("Turtle " .. laneId .. " finished its assigned run.")
