@@ -9,11 +9,12 @@
 --   * Place it facing the direction the whole fleet will tunnel.
 --   * NO chest needed behind it anymore -- the service turtle handles that.
 --   * Attach a wireless modem to the turtle (any side).
---   * Put a stack of Spot Loaders in slot 15 -- the turtle places one
---     (facing up, out of the tunnel's way) at the start of every new chunk
---     so that chunk stays loaded while it works.
---   * Line up all 16 turtles side by side, 1 block apart, all facing the
---     same way.
+--   * ONLY turtle 0 needs a stack of Spot Loaders in slot 15 -- since all
+--     16 lanes together are exactly one chunk wide, only lane 0 places a
+--     loader (facing up, out of the tunnel's way) at the start of each new
+--     chunk. The other 15 turtles can leave slot 15 empty.
+--   * Line up all 16 turtles immediately next to each other (flush, no
+--     gaps -- lane 0 at x=0, lane 1 at x=1, etc.), all facing the same way.
 --   * Also set up quarry_service.lua on a dedicated service turtle (see
 --     that file's header for placement) and a proper Chunk Loader at
 --     home base covering the control computer + service turtle's chest.
@@ -207,7 +208,9 @@ local chunkNum = 1
 
 while true do
   ensureOkToContinue()
-  placeChunkLoader()
+  if laneId == 0 then
+    placeChunkLoader() -- only one turtle needs to; one loader covers the whole chunk
+  end
 
   for layer = 0, depth - 1 do
     local target = (layer % 2 == 0) and (zBase + length - 1) or zBase
