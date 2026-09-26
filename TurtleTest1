@@ -186,6 +186,11 @@ local UNBREAKABLE_TRIES = 5 -- failed digs in a row before we call it bedrock
 -- One step digs at most 3 blocks (ahead, above, below), so with 3 free
 -- slots a new kind of ore always has somewhere to go.
 local MIN_FREE_SLOTS = 3
+-- After throwing out junk we want at least this many free, or we unload
+-- right away: when the slots are full of different ores, emptying the
+-- junk frees only a slot or so, and we'd be back at the trash can every
+-- few blocks.
+local FREE_AFTER_DUMP = MIN_FREE_SLOTS + 2
 local SAMPLE_SLOTS = { 12, 13, 14 } -- one each of the junk to throw away
 local TRASH_SLOT = 15       -- Extra Utilities Trash Can
 local LAST_FRONT_SLOT = 11  -- with a trash can, cargo the service turtle takes is in 1..11
@@ -503,10 +508,14 @@ local function tidy_slot_16()
 end
 
 -- (see MIN_FREE_SLOTS)
-local function inventory_nearly_full()
+local function free_cargo_slots()
   local cargo_slots = 0
   for i = 1, 16 do if is_cargo(i) then cargo_slots = cargo_slots + 1 end end
-  return cargo_slots - used_cargo_slots() < MIN_FREE_SLOTS
+  return cargo_slots - used_cargo_slots()
+end
+
+local function inventory_nearly_full()
+  return free_cargo_slots() < MIN_FREE_SLOTS
 end
 
 -- How much fuel we can hold (advanced turtles 100000, others 20000).
@@ -668,6 +677,39 @@ local function dump_junk()
   say(nil, "working")
 end
 
+-- One suck() by the service turtle takes the first item it finds AND the
+-- same item from every other slot (up to 64), samples and loaders
+-- included. So before it pulls "N stacks": junk goes in the trash, cargo
+-- that matches a slot we keep moves into that slot, and equal items are
+-- merged. Then each pull empties exactly one of our cargo slots.
+local function compact_cargo()
+  dump_junk()
+  local keep = {}
+  for i = 1, 16 do
+    if not is_cargo(i) and turtle.getItemCount(i) > 0 then table.insert(keep, i) end
+  end
+  for i = 1, 16 do
+    if is_cargo(i) and turtle.getItemCount(i) > 0 then
+      turtle.select(i)
+      for _, k in ipairs(keep) do
+        if k ~= TRASH_SLOT and turtle.getItemCount(i) > 0 and turtle.compareTo(k) then
+          turtle.transferTo(k)
+        end
+      end
+      for j = i + 1, 16 do
+        if turtle.getItemCount(i) == 0 then break end
+        if is_cargo(j) and turtle.getItemCount(j) > 0 and turtle.getItemSpace(i) > 0 then
+          turtle.select(j)
+          if turtle.compareTo(i) then turtle.transferTo(i) end
+          turtle.select(i)
+        end
+      end
+    end
+  end
+  turtle.select(1)
+  tidy_slot_16() -- so the service turtle can reach it (it takes slots 1-11)
+end
+
 -- Service turtle ------------------------------------------------------------
 -- Drives home to our start spot and waits there while the service turtle
 -- (on the home row right behind us) pulls out our blocks and hands us
@@ -687,12 +729,11 @@ local function request_service(label)
     go_to_z(0)
     if not (S.y == 0 and S.z == 0) then sleep(5) end
   end
-  dump_junk() -- no point carrying junk to the service turtle
-  tidy_slot_16() -- so the service turtle can reach it (it takes slots 1-11)
 
   -- enough to get back to work, work a row, and come home again
   local need = 2 * (math.abs(ry) + rz) + S.length + FUEL_BUFFER
   while true do
+  compact_cargo() -- (also: no point carrying junk to the service turtle)
   service_seq = service_seq + 1
   local req = {
     cmd = "service_request", id = LANE,
@@ -767,15 +808,19 @@ end
 
 local function ensure_ok()
   flush_status()
+  local unload = false
   if inventory_nearly_full() then
     dump_junk()
     burn_fuel() -- coal we mined: as much as fits in the tank, freeing slots
+    unload = free_cargo_slots() < FREE_AFTER_DUMP
   elseif fuel_level() < fuel_needed() then
     burn_fuel()
   end
   -- loop: one delivery might not be enough
-  while fuel_level() < fuel_needed() or inventory_nearly_full() do
+  while unload or fuel_level() < fuel_needed() or inventory_nearly_full() do
+    unload = false
     request_service()
+    if S.stopped then return end
   end
 end
 
