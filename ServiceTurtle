@@ -13,10 +13,34 @@
 --     blocks to its right) -- it will dig that row if needed, but never
 --     digs inside the lanes, so it can't destroy a mining turtle.
 --   * Wireless modem.
---   * Run: quarry_service   (leave it running; Ctrl+T to stop when done)
+--   * Run: s   (leave it running; Ctrl+T to stop when done)
+--          s install   also run automatically every time it boots
+--          s here      "I'm back on my home spot" after a reboot away from home
 --   * Home must stay chunk-loaded (control computer + both chests).
+--
+-- INVENTORY: slots 1-12 = mined blocks, slots 13-16 = coal for the miners
+-- (filled automatically from the fuel chest). It only goes home when it
+-- has no room for the next load, runs low on coal, or has been idle for
+-- 30 seconds.
 
 local SERVICE_PROTOCOL = "chunkservice" -- miners <-> service turtle
+
+local OPTION = ({ ... })[1]
+local PROGRAM = shell and shell.getRunningProgram() or "quarry_service"
+if OPTION == "install" then
+  local f = fs.open("startup", "w")
+  f.write('shell.run("' .. PROGRAM .. '")\n')
+  f.close()
+  print("Done: this turtle now runs '" .. PROGRAM .. "' every time it boots.")
+  print("Reboot (hold Ctrl+R) to start it. To undo: delete startup")
+  return
+end
+
+-- This file exists whenever we're away from the home spot. Our position is
+-- only kept in memory, so if we boot up and find it, we were interrupted
+-- (server restart, chunk unloaded, reboot) and don't know where we are.
+local AWAY_FILE = ".quarry_away"
+if OPTION == "here" then fs.delete(AWAY_FILE) end
 
 local function open_modem()
   for _, side in ipairs(rs.getSides()) do
@@ -33,12 +57,23 @@ if not open_modem() then
 end
 
 -- Config --------------------------------------------------------------------
-local FUEL_SLOT = 16        -- delivery stock; never used for cargo
+-- Inventory: slots 1-12 carry mined blocks, slots 13-16 carry coal for the
+-- miners (4 stacks = 256 coal = 16 deliveries between trips home).
+local CARGO_SLOTS = 12
+local FIRST_FUEL_SLOT = 13
 local FUEL_BATCH = 16       -- fuel items handed to a miner per visit (16 coal = 1280 moves)
 local MINER_FUEL_TARGET = 1500 -- only hand over fuel if the miner has less than this
 local SELF_FUEL_TARGET = 2000
+local LOW_STOCK = FUEL_BATCH * 4 -- when idle, go home to refill below this
+local IDLE_HOME_AFTER = 30  -- seconds with nothing to do before going home
 local HANDSHAKE_TIMEOUT = 60
 local UNBREAKABLE_TRIES = 5
+
+local function fuel_stock()
+  local n = 0
+  for slot = FIRST_FUEL_SLOT, 16 do n = n + turtle.getItemCount(slot) end
+  return n
+end
 
 -- Dashboard -----------------------------------------------------------------
 -- Status updates for the control computer's display. Fire-and-forget:
@@ -57,14 +92,41 @@ local function report(state, text, lane)
   rednet.broadcast({
     cmd = "service", state = status.state, lane = status.lane, text = text,
     queue = #queue, fuel = turtle.getFuelLevel(),
-    stock = turtle.getItemCount(16),
+    stock = fuel_stock(),
   }, STATUS_PROTOCOL)
   last_report = os.clock()
+end
+
+if fs.exists(AWAY_FILE) then
+  report("LOST - move home", "I was restarted away from my home spot and don't know where I am.")
+  print("Put me back on my home spot (above the fuel chest, facing")
+  print("the same way as the miners), then run:")
+  print("  " .. PROGRAM .. " here")
+  return
 end
 
 -- sx = blocks to the right of home (along the row of lanes)
 -- sz = blocks forward from home (into the tunnels)
 local sx, sz, facing = 0, 0, 0 -- facing: 0 = tunnel dir, 1 = right, 2 = back, 3 = left
+
+-- Keeps AWAY_FILE in step with whether we're on the home spot facing forward.
+-- It's written BEFORE any turn or step (so a restart mid-move still counts
+-- as lost) and only removed once we're back home facing forward.
+local away = false
+local function write_away(now_away)
+  if now_away == away then return end
+  away = now_away
+  if away then
+    local f = fs.open(AWAY_FILE, "w")
+    f.write("service turtle is away from its home spot\n")
+    f.close()
+  else
+    fs.delete(AWAY_FILE)
+  end
+end
+local function update_away()
+  write_away(sx ~= 0 or sz ~= 0 or facing ~= 0)
+end
 
 local function fuel_level()
   local level = turtle.getFuelLevel()
@@ -75,6 +137,7 @@ end
 -- Movement ------------------------------------------------------------------
 local function face(dir)
   local diff = (dir - facing) % 4
+  if diff ~= 0 then write_away(true) end
   if diff == 1 then
     turtle.turnRight()
   elseif diff == 2 then
@@ -84,6 +147,7 @@ local function face(dir)
     turtle.turnLeft()
   end
   facing = dir
+  update_away()
 end
 
 local function track_step()
@@ -91,6 +155,7 @@ local function track_step()
   elseif facing == 1 then sx = sx + 1
   elseif facing == 2 then sz = sz - 1
   else sx = sx - 1 end
+  update_away()
 end
 
 -- One step forward. Digs only when allow_dig is true (the home row, where
@@ -102,6 +167,7 @@ local function forward(allow_dig)
   local failed_digs = 0
   local waited = 0
   local warned_entity = false
+  write_away(true)
   while not turtle.forward() do
     if turtle.getFuelLevel() == 0 then
       report("OUT OF FUEL", "Out of fuel!")
@@ -161,33 +227,68 @@ local function go_to(x, z)
 end
 
 -- Inventory -----------------------------------------------------------------
-local function cargo_empty()
-  for i = 1, 15 do
-    if turtle.getItemCount(i) > 0 then return false end
+local function free_cargo_slots()
+  local n = 0
+  for i = 1, CARGO_SLOTS do
+    if turtle.getItemCount(i) == 0 then n = n + 1 end
   end
-  return true
+  return n
 end
 
--- Pulls fuel from the chest below into slot 16 until it's a full stack.
+local function cargo_empty()
+  return free_cargo_slots() == CARGO_SLOTS
+end
+
+-- Fills the fuel slots (13-16) from the fuel chest below.
 local function top_up_fuel()
-  turtle.select(FUEL_SLOT)
-  while turtle.getItemCount(FUEL_SLOT) < 64 do
-    local before = turtle.getItemCount(FUEL_SLOT)
-    if not turtle.suckDown() then break end
-    -- anything that didn't fit into slot 16 goes back in the chest
-    for i = 1, 15 do
-      if turtle.getItemCount(i) > 0 then
-        turtle.select(i)
-        turtle.dropDown()
+  for slot = FIRST_FUEL_SLOT, 16 do
+    turtle.select(slot)
+    while turtle.getItemCount(slot) < 64 do
+      local before = turtle.getItemCount(slot)
+      if not turtle.suckDown() then break end
+      -- anything that spilled into the cargo slots goes back in the chest
+      for i = 1, CARGO_SLOTS do
+        if turtle.getItemCount(i) > 0 then
+          turtle.select(i)
+          turtle.dropDown()
+        end
       end
+      turtle.select(slot)
+      if turtle.getItemCount(slot) == before then break end
     end
-    turtle.select(FUEL_SLOT)
-    if turtle.getItemCount(FUEL_SLOT) == before then break end
   end
+  turtle.select(1)
+end
+
+-- Burns ONE fuel item from the stock (never a whole stack, so there's
+-- always some left to deliver).
+local function burn_one_fuel()
+  for slot = 16, FIRST_FUEL_SLOT, -1 do
+    if turtle.getItemCount(slot) > 0 then
+      turtle.select(slot)
+      local ok = turtle.refuel(1)
+      turtle.select(1)
+      return ok
+    end
+  end
+  return false
+end
+
+-- Hands `count` fuel items to the turtle in front of us.
+local function hand_over_fuel(count)
+  for slot = 16, FIRST_FUEL_SLOT, -1 do
+    if count <= 0 then break end
+    local n = math.min(count, turtle.getItemCount(slot))
+    if n > 0 then
+      turtle.select(slot)
+      if turtle.drop(n) then count = count - n end
+    end
+  end
+  turtle.select(1)
 end
 
 -- Goes home, empties cargo into the output chest, refuels itself and
--- refills the delivery stock.
+-- refills the coal stock.
 local function restock()
   report("restocking at home", nil, false)
   while not go_to(0, 0) do
@@ -197,7 +298,7 @@ local function restock()
 
   face(2)
   while not cargo_empty() do
-    for i = 1, 15 do
+    for i = 1, CARGO_SLOTS do
       if turtle.getItemCount(i) > 0 then
         turtle.select(i)
         turtle.drop()
@@ -210,18 +311,15 @@ local function restock()
   end
 
   top_up_fuel()
-  -- Burn ONE item at a time, so there's always stock left to deliver.
-  -- (The old version called refuel() with no count, which burned the
-  -- whole stack and left nothing for the miners.)
-  while fuel_level() < SELF_FUEL_TARGET and turtle.getItemCount(FUEL_SLOT) > FUEL_BATCH do
-    if not turtle.refuel(1) then
-      report("BAD FUEL", "Slot 16 isn't fuel! Only put fuel in the fuel chest.")
+  while fuel_level() < SELF_FUEL_TARGET and fuel_stock() > FUEL_BATCH do
+    if not burn_one_fuel() then
+      report("BAD FUEL", "The coal slots (13-16) hold something that isn't fuel! Only put fuel in the fuel chest.")
       break
     end
   end
   top_up_fuel()
 
-  while turtle.getItemCount(FUEL_SLOT) == 0 do
+  while fuel_stock() == 0 do
     report("FUEL CHEST EMPTY", "Fuel chest is empty! Add fuel...")
     sleep(10)
     top_up_fuel()
@@ -263,7 +361,7 @@ local function handle_message(sender, msg)
     queued[msg.id] = key
     table.insert(queue, {
       id = msg.id, session = msg.session, seq = msg.seq,
-      z = msg.z, fuel = msg.fuel, sender = sender, key = key,
+      z = msg.z, fuel = msg.fuel, stacks = msg.stacks, sender = sender, key = key,
     })
     print("Queued lane " .. msg.id)
     report()
@@ -273,8 +371,14 @@ end
 
 local function serve(job)
   local trip = 2 * (job.id + 1 + job.z) + 20
-  if not cargo_empty()
-      or turtle.getItemCount(FUEL_SLOT) < FUEL_BATCH
+  -- ("unlimited" fuel comes through as a string: no delivery needed)
+  local needs_fuel = type(job.fuel) == "number" and job.fuel < MINER_FUEL_TARGET
+  -- the miner tells us how many slots of blocks it will hand over
+  local space_needed = math.min(job.stacks or CARGO_SLOTS, CARGO_SLOTS)
+  -- only go home when we must: no room for this load, not enough coal
+  -- to hand over, or not enough fuel for the trip ourselves
+  if free_cargo_slots() < space_needed
+      or (needs_fuel and fuel_stock() < FUEL_BATCH)
       or fuel_level() < trip then
     restock()
   end
@@ -309,12 +413,7 @@ local function serve(job)
     handle_message(sender, msg)
   end
 
-  -- ("unlimited" fuel comes through as a string: no delivery needed)
-  if type(job.fuel) == "number" and job.fuel < MINER_FUEL_TARGET then
-    turtle.select(FUEL_SLOT)
-    turtle.drop(FUEL_BATCH)
-    turtle.select(1)
-  end
+  if needs_fuel then hand_over_fuel(FUEL_BATCH) end
 
   served[job.id] = job.key
   reply(job.sender, "serviced", job)
@@ -326,18 +425,31 @@ report("starting up", "Service turtle starting up...")
 restock()
 report("idle at home", "Ready. Waiting for requests...", false)
 
+local idle_since
 while true do
   if #queue > 0 then
+    idle_since = nil
     local job = table.remove(queue, 1)
     queued[job.id] = nil
     current_key = job.key
     serve(job) -- if this fails, the miner re-sends and we try again
     current_key = nil
   else
-    if sx ~= 0 or sz ~= 0 then
-      restock() -- idle: go home, unload, refill
+    -- Never wait inside a lane: a miner driving home could get stuck behind
+    -- us. The home row is ours alone, so wait there.
+    if sz ~= 0 then
+      report("waiting on the home row", nil, false)
+      go_to_z(0)
+    end
+    -- After a while with nothing to do, go home to empty out and refill.
+    idle_since = idle_since or os.clock()
+    local at_home = sx == 0 and sz == 0
+    if os.clock() - idle_since >= IDLE_HOME_AFTER
+        and (not at_home or not cargo_empty() or fuel_stock() < LOW_STOCK) then
+      restock()
       print("Ready. Waiting for requests...")
       report("idle at home", nil, false)
+      idle_since = os.clock()
     end
     local sender, msg = rednet.receive(SERVICE_PROTOCOL, 2)
     if msg then handle_message(sender, msg) end

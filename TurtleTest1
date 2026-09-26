@@ -1,5 +1,8 @@
 -- quarry_turtle (mining turtle) -- ComputerCraft 1.63
--- Usage: quarry_turtle <laneId>      (laneId 0..15)
+-- Usage: m <laneId>            run as lane <laneId> (0..15)
+--        m <laneId> install    also run automatically every time it boots
+--        m <laneId> here       "I'm back on my start spot" after a reboot
+--                              in the middle of a run
 --
 -- Mines its own 1-wide lane of the current chunk, 3 layers per pass
 -- (digs up and down as it goes). When it needs fuel or its inventory is
@@ -15,11 +18,28 @@
 
 local args = { ... }
 local LANE = tonumber(args[1])
+local OPTION = args[2]
+local PROGRAM = shell and shell.getRunningProgram() or "quarry_turtle"
 if not LANE then
-  local name = shell and shell.getRunningProgram() or "quarry_turtle"
-  print("Usage: " .. name .. " <laneId>   (lane 0..15)")
+  print("Usage: " .. PROGRAM .. " <laneId>   (lane 0..15)")
+  print("       " .. PROGRAM .. " <laneId> install   (run on every boot)")
   return
 end
+
+if OPTION == "install" then
+  local f = fs.open("startup", "w")
+  f.write('shell.run("' .. PROGRAM .. '", "' .. LANE .. '")\n')
+  f.close()
+  print("Done: this turtle now runs '" .. PROGRAM .. " " .. LANE .. "' every time it boots.")
+  print("Reboot (hold Ctrl+R) to start it. To undo: delete startup")
+  return
+end
+
+-- While a run is in progress this file exists. Our position is only kept
+-- in memory, so if we boot up and find it, we were interrupted mid-run
+-- (server restart, chunk unloaded, reboot) and don't know where we are.
+local AWAY_FILE = ".quarry_away"
+if OPTION == "here" then fs.delete(AWAY_FILE) end
 
 local PROTOCOL = "chunkquarry"          -- control computer <-> miners
 local SERVICE_PROTOCOL = "chunkservice" -- miners <-> service turtle
@@ -45,6 +65,23 @@ local STATUS_PROTOCOL = "chunkstatus"
 local function say(text, state)
   if text then print(text) end
   rednet.broadcast({ cmd = "status", id = LANE, text = text, state = state }, STATUS_PROTOCOL)
+end
+
+if fs.exists(AWAY_FILE) then
+  say("I was restarted in the middle of a run and don't know where I am.", "LOST - move to start")
+  print("Put me back on my start spot, facing the tunnel, then run:")
+  print("  " .. PROGRAM .. " " .. LANE .. " here")
+  return
+end
+
+local function set_away(away)
+  if away then
+    local f = fs.open(AWAY_FILE, "w")
+    f.write("lane " .. LANE .. " is away from its start spot\n")
+    f.close()
+  else
+    fs.delete(AWAY_FILE)
+  end
 end
 
 -- IMPORTANT: a turtle throws away rednet messages that arrive while it is
@@ -223,11 +260,21 @@ local function has_cargo()
   return false
 end
 
-local function inventory_full()
+-- Number of our slots that hold mined blocks.
+local function used_cargo_slots()
+  local n = 0
   for i = 1, 16 do
-    if is_cargo(i) and turtle.getItemCount(i) == 0 then return false end
+    if is_cargo(i) and turtle.getItemCount(i) > 0 then n = n + 1 end
   end
-  return true
+  return n
+end
+
+-- We call the service turtle while a few slots are still free: it carries
+-- 12 stacks, so this way one visit can take everything we have.
+local MIN_FREE_SLOTS = 5
+local function inventory_nearly_full()
+  local cargo_slots = (LANE == 0) and 15 or 16
+  return cargo_slots - used_cargo_slots() < MIN_FREE_SLOTS
 end
 
 -- We hand our blocks to the service turtle (instead of it sucking them
@@ -267,7 +314,7 @@ local function request_service()
   local req = {
     cmd = "service_request", id = LANE,
     session = session, seq = service_seq, z = z_base,
-    fuel = turtle.getFuelLevel(),
+    fuel = turtle.getFuelLevel(), stacks = used_cargo_slots(),
   }
   print("Waiting for service turtle...")
   say(nil, "waiting for service")
@@ -313,7 +360,7 @@ end
 
 local function ensure_ok()
   -- loop: one delivery might not be enough
-  while fuel_level() < fuel_needed() or inventory_full() do
+  while fuel_level() < fuel_needed() or inventory_nearly_full() do
     request_service()
   end
 end
@@ -468,6 +515,7 @@ while true do
 end
 
 print("Started: " .. length .. " long, " .. depth .. " deep.")
+set_away(true) -- from here on, a restart means we are lost
 
 while true do
   ensure_ok()
@@ -508,4 +556,9 @@ ensure_fuel_for(z)
 go_to_y(0)
 go_to_z(0)
 face(0)
-say("Finished, back at the start.", "finished")
+if y == 0 and z == 0 then
+  set_away(false)
+  say("Finished, back at the start.", "finished")
+else
+  say("Finished, but couldn't get all the way back to my start spot!", "LOST - move to start")
+end
