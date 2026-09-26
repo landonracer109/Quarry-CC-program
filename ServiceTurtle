@@ -1,29 +1,40 @@
 -- quarry_service (service turtle) -- ComputerCraft 1.63
 -- Run on ONE dedicated turtle. It shuttles between the mining turtles,
--- taking their mined blocks and handing them fuel, so the miners never
+-- pulling out their mined blocks and handing them fuel, so the miners never
 -- need their own chests.
 --
 -- SETUP (stand behind the miners, looking the way they face):
 --   * HOME spot: one block BEHIND lane 0's start and one block to its LEFT.
 --     Place the service turtle there, facing the same way as the miners.
---   * OUTPUT chest directly BEHIND the home spot (mined blocks go here).
+--   * OUTPUT chest directly ABOVE the home spot (mined blocks go here;
+--     pipe them out of it to bigger storage).
 --   * FUEL chest directly BELOW the home spot. Put ONLY fuel in it, and
---     only one kind (e.g. all coal).
+--     only one kind (e.g. all coal). Keep some fuel in it: after a restart
+--     the turtle finds home by the chests above and below it.
+--   * Recommended: any solid block directly IN FRONT of the home spot.
 --   * Clear the row the service turtle drives along (home spot + the 16
 --     blocks to its right) -- it will dig that row if needed, but never
 --     digs inside the lanes, so it can't destroy a mining turtle.
 --   * Wireless modem.
 --   * Run: s   (leave it running; Ctrl+T to stop when done)
 --          s install   also run automatically every time it boots
---          s here      "I'm back on my home spot" after a reboot away from home
+--          s here      "I'm on my home spot" -- only needed if it says LOST
 --   * Home must stay chunk-loaded (control computer + both chests).
 --
 -- INVENTORY: slots 1-12 = mined blocks, slots 13-16 = coal for the miners
 -- (filled automatically from the fuel chest). It only goes home when it
 -- has no room for the next load, runs low on coal, or has been idle for
 -- 30 seconds.
+--
+-- SURVIVES SERVER RESTARTS: it saves its position before every move and
+-- turn. After a restart its fuel level tells whether the last move
+-- happened (every move costs exactly 1 fuel). It only ever faces forward
+-- or right (driving backward instead of turning around), so if a restart
+-- comes mid-turn there are just two possibilities: it tries each by
+-- driving home without digging and checking for the fuel chest underneath.
 
 local SERVICE_PROTOCOL = "chunkservice" -- miners <-> service turtle
+local STATUS_PROTOCOL = "chunkstatus"   -- status updates for the dashboard
 
 local OPTION = ({ ... })[1]
 local PROGRAM = shell and shell.getRunningProgram() or "quarry_service"
@@ -36,11 +47,12 @@ if OPTION == "install" then
   return
 end
 
--- This file exists whenever we're away from the home spot. Our position is
--- only kept in memory, so if we boot up and find it, we were interrupted
--- (server restart, chunk unloaded, reboot) and don't know where we are.
-local AWAY_FILE = ".quarry_away"
-if OPTION == "here" then fs.delete(AWAY_FILE) end
+local STATE_FILES = { ".service_state_a", ".service_state_b" }
+if OPTION == "here" then
+  for _, name in ipairs(STATE_FILES) do fs.delete(name) end
+  fs.delete(".quarry_away") -- left over from older versions
+  print("OK: starting fresh from the home spot.")
+end
 
 local function open_modem()
   for _, side in ipairs(rs.getSides()) do
@@ -75,10 +87,15 @@ local function fuel_stock()
   return n
 end
 
+local function fuel_level()
+  local level = turtle.getFuelLevel()
+  if level == "unlimited" then return math.huge end
+  return level
+end
+
 -- Dashboard -----------------------------------------------------------------
 -- Status updates for the control computer's display. Fire-and-forget:
 -- broadcasting never waits, and a lost update only means a stale display.
-local STATUS_PROTOCOL = "chunkstatus"
 local queue = {}   -- FIFO of service jobs (see Requests below)
 local status = { state = "starting up", lane = false }
 local last_report = 0
@@ -97,83 +114,112 @@ local function report(state, text, lane)
   last_report = os.clock()
 end
 
-if fs.exists(AWAY_FILE) then
-  report("LOST - move home", "I was restarted away from my home spot and don't know where I am.")
-  print("Put me back on my home spot (above the fuel chest, facing")
-  print("the same way as the miners), then run:")
-  print("  " .. PROGRAM .. " here")
-  return
+-- Position (saved) ------------------------------------------------------------
+-- P.sx = blocks to the right of home (along the row of lanes)
+-- P.sz = blocks forward from home (into the tunnels)
+-- P.facing: 0 = tunnel direction, 1 = right, 2 = back, 3 = left
+-- P.moving   = a forward move was about to happen (fuel tells if it did)
+-- P.turn_to  = a turn to this facing was about to happen
+-- P.recovering = we were finding our facing after a restart
+-- Saved to two files in turn, so a restart mid-write never loses both.
+local P = { sx = 0, sz = 0, facing = 0 }
+local save_seq = 0
+
+local function save()
+  save_seq = save_seq + 1
+  P.seq = save_seq
+  P.fuel = turtle.getFuelLevel()
+  local f = fs.open(STATE_FILES[save_seq % 2 + 1], "w")
+  f.write(textutils.serialize(P))
+  f.close()
 end
 
--- sx = blocks to the right of home (along the row of lanes)
--- sz = blocks forward from home (into the tunnels)
-local sx, sz, facing = 0, 0, 0 -- facing: 0 = tunnel dir, 1 = right, 2 = back, 3 = left
-
--- Keeps AWAY_FILE in step with whether we're on the home spot facing forward.
--- It's written BEFORE any turn or step (so a restart mid-move still counts
--- as lost) and only removed once we're back home facing forward.
-local away = false
-local function write_away(now_away)
-  if now_away == away then return end
-  away = now_away
-  if away then
-    local f = fs.open(AWAY_FILE, "w")
-    f.write("service turtle is away from its home spot\n")
-    f.close()
-  else
-    fs.delete(AWAY_FILE)
+local function load_state()
+  local best
+  for _, name in ipairs(STATE_FILES) do
+    if fs.exists(name) then
+      local f = fs.open(name, "r")
+      local text = f.readAll()
+      f.close()
+      local ok, t = pcall(textutils.unserialize, text)
+      if ok and type(t) == "table" and type(t.seq) == "number"
+          and (not best or t.seq > best.seq) then
+        best = t
+      end
+    end
   end
-end
-local function update_away()
-  write_away(sx ~= 0 or sz ~= 0 or facing ~= 0)
+  return best
 end
 
-local function fuel_level()
-  local level = turtle.getFuelLevel()
-  if level == "unlimited" then return math.huge end
-  return level
+-- While finding our facing after a restart, every turn and step is also
+-- recorded here, so each guess can be replayed from the same start.
+local recording
+
+local DX = { [0] = 0, 1, 0, -1 }
+local DZ = { [0] = 1, 0, -1, 0 }
+
+-- dir = 1 for a step forward, -1 for a step backward
+local function track_step(dir)
+  P.sx = P.sx + DX[P.facing] * dir
+  P.sz = P.sz + DZ[P.facing] * dir
 end
 
 -- Movement ------------------------------------------------------------------
+-- We only ever face two ways: forward (0, into the lanes) and right (1,
+-- along the home row). Going the other way we drive backward instead of
+-- turning around, so the only turns are single quarter turns at a lane
+-- entrance -- never on the home spot, where a restart mid-turn couldn't be
+-- told apart.
+
+-- One quarter turn, saved before and after: a restart in between leaves
+-- P.turn_to set, meaning "facing is P.facing or P.turn_to".
+local function quarter_turn(right)
+  local to = (P.facing + (right and 1 or 3)) % 4
+  P.turn_to = to
+  save()
+  if right then turtle.turnRight() else turtle.turnLeft() end
+  P.facing = to
+  P.turn_to = nil
+  save()
+  if recording then table.insert(recording, right and "R" or "L") end
+end
+
 local function face(dir)
-  local diff = (dir - facing) % 4
-  if diff ~= 0 then write_away(true) end
+  local diff = (dir - P.facing) % 4
   if diff == 1 then
-    turtle.turnRight()
+    quarter_turn(true)
   elseif diff == 2 then
-    turtle.turnRight()
-    turtle.turnRight()
+    quarter_turn(true)
+    quarter_turn(true)
   elseif diff == 3 then
-    turtle.turnLeft()
+    quarter_turn(false)
   end
-  facing = dir
-  update_away()
 end
 
-local function track_step()
-  if facing == 0 then sz = sz + 1
-  elseif facing == 1 then sx = sx + 1
-  elseif facing == 2 then sz = sz - 1
-  else sx = sx - 1 end
-  update_away()
-end
-
--- One step forward. Digs only when allow_dig is true (the home row, where
--- no mining turtle ever goes). Inside lanes it waits instead, because the
--- only solid thing there could be a turtle -- and turtles CAN dig turtles.
--- Never attacks: CC 1.63 can't tell a mob from a player, so it waits for
--- anything that isn't a block to move out of the way.
-local function forward(allow_dig)
-  local failed_digs = 0
-  local waited = 0
-  local warned_entity = false
-  write_away(true)
-  while not turtle.forward() do
+-- One step forward (or backward), saved before it happens: after a restart
+-- our fuel level tells whether it did (every move costs exactly 1 fuel).
+-- Digs only going forward along the home row, where no mining turtle ever
+-- goes. In the lanes it waits instead, because the only solid thing there
+-- could be a turtle -- and turtles CAN dig turtles. Never attacks: CC 1.63
+-- can't tell a mob from a player, so it waits for it to move. While finding
+-- our facing after a restart it never digs and gives up quickly.
+local function step(backward, allow_dig)
+  local move = backward and turtle.back or turtle.forward
+  local failed_digs, waited, warned = 0, 0, false
+  while true do
+    P.moving = backward and "b" or "f"
+    save()
+    local moved = move()
+    P.moving = nil
+    if moved then break end
     if turtle.getFuelLevel() == 0 then
       report("OUT OF FUEL", "Out of fuel!")
       return false
     end
-    if turtle.detect() then
+    waited = waited + 1
+    if recording then
+      if waited >= 5 then return false end -- a wrong guess runs into walls
+    elseif not backward and turtle.detect() then
       if allow_dig then
         if turtle.dig() then
           failed_digs = 0
@@ -182,41 +228,39 @@ local function forward(allow_dig)
           if failed_digs >= UNBREAKABLE_TRIES then return false end
         end
       else
-        waited = waited + 1
         if waited == 1 then report("blocked in a lane", "Blocked inside a lane, waiting...") end
         if waited >= 30 then return false end
-        sleep(1)
       end
     else
-      if not warned_entity then
+      -- a mob or player in front, or anything behind us (we can't see back)
+      if not warned then
         report("blocked", "Something is in my way. Waiting for it to move...")
-        warned_entity = true
+        warned = true
       end
-      sleep(1)
+      if backward and waited >= 60 then return false end
     end
-    sleep(0.3)
+    sleep(1)
   end
-  track_step()
+  track_step(backward and -1 or 1)
+  if recording then table.insert(recording, backward and "B" or "F") end
   return true
 end
 
--- Along the home row (sz = 0), digging allowed.
+-- Along the home row, always facing right: forward = right, backward = left.
 local function go_to_x(target)
-  if sx == target then return true end
-  face(sx < target and 1 or 3)
-  while sx ~= target do
-    if not forward(true) then return false end
-  end
+  if P.sx == target then return true end
+  face(1)
+  while P.sx < target do if not step(false, true) then return false end end
+  while P.sx > target do if not step(true) then return false end end
   return true
 end
 
--- Inside a lane's already-mined tunnel, never digs.
+-- In and out of a lane, always facing forward: back out backward.
 local function go_to_z(target)
-  if sz == target then return true end
-  face(sz < target and 0 or 2)
-  while sz ~= target do
-    if not forward(false) then return false end
-  end
+  if P.sz == target then return true end
+  face(0)
+  while P.sz < target do if not step(false, false) then return false end end
+  while P.sz > target do if not step(true) then return false end end
   return true
 end
 
@@ -224,6 +268,56 @@ end
 -- miners' start line; depth moves only happen inside a lane's own tunnel.
 local function go_to(x, z)
   return go_to_z(0) and go_to_x(x) and go_to_z(z)
+end
+
+-- Restart recovery ------------------------------------------------------------
+-- True if we're on the home spot: the output chest above us and the fuel
+-- chest below (the only place where sucking from below gets anything --
+-- recovery never takes us above a miner). What we pull out goes back.
+local function on_fuel_chest()
+  if not turtle.detectUp() then return false end
+  local slot = 16 -- a coal slot, if no slot is empty
+  for i = 1, 16 do
+    if turtle.getItemCount(i) == 0 then slot = i break end
+  end
+  turtle.select(slot)
+  local before = turtle.getItemCount(slot)
+  local got = turtle.suckDown()
+  local gained = turtle.getItemCount(slot) - before
+  if gained > 0 then turtle.dropDown(gained) end
+  turtle.select(1)
+  return got
+end
+
+-- We know where we are but not which way we face (the server stopped in
+-- the middle of a turn at a lane entrance, so we face forward or right).
+-- Try each: drive home without digging and check for the chests. We try
+-- "facing right" first: if that's wrong, backing up "along the row" really
+-- takes us backward, behind the row and away from the lanes, never above a
+-- miner. Every move is recorded, so after a wrong guess we can work out
+-- where we really are under the next one.
+local function find_facing(candidates)
+  P.recovering = true
+  save()
+  local start_x, start_z = P.sx, P.sz
+  recording = {}
+  for _, guess in ipairs(candidates) do
+    -- where we are now if we were facing `guess` at the start
+    P.sx, P.sz, P.facing = start_x, start_z, guess
+    for _, op in ipairs(recording) do
+      if op == "R" then P.facing = (P.facing + 1) % 4
+      elseif op == "L" then P.facing = (P.facing + 3) % 4
+      else track_step(op == "F" and 1 or -1) end
+    end
+    if go_to(0, 0) and on_fuel_chest() then
+      recording = nil
+      P.recovering = nil
+      save()
+      return true
+    end
+  end
+  recording = nil
+  return false
 end
 
 -- Inventory -----------------------------------------------------------------
@@ -296,12 +390,12 @@ local function restock()
     sleep(5)
   end
 
-  face(2)
+  -- the output chest sits on top of the home spot
   while not cargo_empty() do
     for i = 1, CARGO_SLOTS do
       if turtle.getItemCount(i) > 0 then
         turtle.select(i)
-        turtle.drop()
+        turtle.dropUp()
       end
     end
     if not cargo_empty() then
@@ -317,6 +411,7 @@ local function restock()
       break
     end
   end
+  save() -- fuel changed: the saved fuel level must match again
   top_up_fuel()
 
   while fuel_stock() == 0 do
@@ -326,7 +421,6 @@ local function restock()
   end
 
   turtle.select(1)
-  face(0)
 end
 
 -- Requests ------------------------------------------------------------------
@@ -392,10 +486,11 @@ local function serve(job)
   end
   face(0)
 
-  -- Tell the miner we're here and wait for it to drop its blocks into us.
+  -- Tell the miner we're here; it answers with how many stacks it has.
   report("unloading lane " .. job.id)
   local start = os.clock()
   local last_sent = -math.huge
+  local stacks
   while true do
     if os.clock() - start > HANDSHAKE_TIMEOUT then
       report(nil, "Lane " .. job.id .. " never answered, skipping.")
@@ -406,11 +501,20 @@ local function serve(job)
       last_sent = os.clock()
     end
     local sender, msg = rednet.receive(SERVICE_PROTOCOL, 1)
-    if type(msg) == "table" and msg.cmd == "unloaded" and msg.id == job.id
+    if type(msg) == "table" and msg.cmd == "ready" and msg.id == job.id
         and msg.session == job.session and msg.seq == job.seq then
+      stacks = msg.stacks or 0
       break
     end
     handle_message(sender, msg)
+  end
+
+  -- Pull exactly that many stacks out of the miner. Its cargo slots come
+  -- before lane 0's chunk loaders (slot 16), and each stack lands in one of
+  -- our empty cargo slots, so we never take the loaders.
+  turtle.select(1)
+  for _ = 1, math.min(stacks, free_cargo_slots()) do
+    if not turtle.suck() then break end
   end
 
   if needs_fuel then hand_over_fuel(FUEL_BATCH) end
@@ -420,11 +524,73 @@ local function serve(job)
   return true
 end
 
--- Main ----------------------------------------------------------------------
+-- Startup -------------------------------------------------------------------
 report("starting up", "Service turtle starting up...")
+local saved = load_state()
+if saved then
+  P = saved
+  save_seq = P.seq
+  if P.recovering then
+    report("LOST - move home", "I was restarted while finding my way home and don't know where I am.")
+    print("Put me back on my home spot (above the fuel chest, facing")
+    print("the same way as the miners), then run:  " .. PROGRAM .. " here")
+    return
+  end
+  -- Did the last step before the restart happen? Every move costs 1 fuel.
+  if P.moving then
+    local now_fuel = turtle.getFuelLevel()
+    if type(now_fuel) ~= "number" or type(P.fuel) ~= "number"
+        or (now_fuel ~= P.fuel and now_fuel ~= P.fuel - 1) then
+      report("LOST - move home", "Restarted mid-move and my fuel doesn't match my notes.")
+      print("Put me back on my home spot (above the fuel chest, facing")
+      print("the same way as the miners), then run:  " .. PROGRAM .. " here")
+      return
+    end
+    if now_fuel == P.fuel - 1 then track_step(P.moving == "b" and -1 or 1) end
+    P.moving = nil
+  end
+  save()
+  if P.turn_to and P.sx == 0 and P.sz == 0 then
+    -- The only turn ever made on the home spot is the very first one, from
+    -- facing forward to facing along the row (which is always clear). If
+    -- the block in front of home was solid, looking ahead tells them apart.
+    if P.front_solid then
+      P.facing = turtle.detect() and 0 or 1
+      P.turn_to = nil
+      save()
+    else
+      report("LOST - move home", "Restarted during my very first turn, so I don't know which way I face.")
+      print("Face me the same way as the miners, then run:  " .. PROGRAM .. " here")
+      print("(Tip: put any block in front of my home spot and this")
+      print("can never happen.)")
+      return
+    end
+  elseif P.turn_to then
+    -- stopped mid-turn: we face forward or right; try "right" first
+    local candidates = { 1, 0 }
+    P.turn_to = nil
+    report("finding my way home", "Restarted mid-turn: working out which way I'm facing...")
+    if not find_facing(candidates) then
+      report("LOST - move home", "Couldn't find my way home after the restart.")
+      print("Put me back on my home spot (above the fuel chest, facing")
+      print("the same way as the miners), then run:  " .. PROGRAM .. " here")
+      return
+    end
+    report(nil, "Found my way home.")
+  elseif P.sx ~= 0 or P.sz ~= 0 then
+    report(nil, "Restarted away from home: going back.")
+  end
+end
+if not saved then
+  -- fresh start on the home spot, facing forward: note whether the block in
+  -- front is solid (see the first-turn case above)
+  P.front_solid = turtle.detect()
+end
+save()
 restock()
 report("idle at home", "Ready. Waiting for requests...", false)
 
+-- Main ----------------------------------------------------------------------
 local idle_since
 while true do
   if #queue > 0 then
@@ -437,13 +603,13 @@ while true do
   else
     -- Never wait inside a lane: a miner driving home could get stuck behind
     -- us. The home row is ours alone, so wait there.
-    if sz ~= 0 then
+    if P.sz ~= 0 then
       report("waiting on the home row", nil, false)
       go_to_z(0)
     end
     -- After a while with nothing to do, go home to empty out and refill.
     idle_since = idle_since or os.clock()
-    local at_home = sx == 0 and sz == 0
+    local at_home = P.sx == 0 and P.sz == 0
     if os.clock() - idle_since >= IDLE_HOME_AFTER
         and (not at_home or not cargo_empty() or fuel_stock() < LOW_STOCK) then
       restock()

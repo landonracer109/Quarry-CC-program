@@ -17,6 +17,11 @@
 --
 -- "c install" makes this computer run the controller on every boot. The
 -- last length/depth/chunks are remembered: just press ENTER to reuse them.
+--
+-- SURVIVES SERVER RESTARTS: the run (settings, lanes, current chunk, who is
+-- done) is saved to disk, and after a restart the controller carries on
+-- where it left off without asking anything. "c new" throws away a saved
+-- run and starts over.
 
 local PROTOCOL = "chunkquarry"        -- control computer <-> miners
 local STATUS_PROTOCOL = "chunkstatus" -- status updates for the dashboard
@@ -35,7 +40,8 @@ if not opened then
 end
 
 local PROGRAM = shell and shell.getRunningProgram() or "quarry_control"
-if ({ ... })[1] == "install" then
+local OPTION = ({ ... })[1]
+if OPTION == "install" then
   local f = fs.open("startup", "w")
   f.write('shell.run("' .. PROGRAM .. '")\n')
   f.close()
@@ -59,17 +65,52 @@ local function ask(question, default)
   return tonumber(read()) or default
 end
 
-term.clear()
-term.setCursorPos(1, 1)
-print("=== Chunk Quarry Control ===")
-print("(press ENTER to keep the value in brackets)")
-local length = ask("Chunk length (blocks per lane)", saved[1])
-local depth = ask("Depth (layers to mine down)", saved[2])
-local chunks = ask("Chunks to mine (0 = until stopped)", saved[3])
+-- A run in progress is saved to two files in turn, so a restart in the
+-- middle of writing one never loses both.
+local RUN_FILES = { ".quarry_run_a", ".quarry_run_b" }
+local run_seq = 0
 
-local f = fs.open(SETTINGS_FILE, "w")
-f.write(length .. "\n" .. depth .. "\n" .. chunks .. "\n")
-f.close()
+local function load_run()
+  local best
+  for _, name in ipairs(RUN_FILES) do
+    if fs.exists(name) then
+      local f = fs.open(name, "r")
+      local text = f.readAll()
+      f.close()
+      local ok, t = pcall(textutils.unserialize, text)
+      if ok and type(t) == "table" and type(t.seq) == "number"
+          and (not best or t.seq > best.seq) then
+        best = t
+      end
+    end
+  end
+  return best
+end
+
+local function clear_run()
+  for _, name in ipairs(RUN_FILES) do fs.delete(name) end
+end
+
+if OPTION == "new" then clear_run() end
+local resumed = load_run()
+
+local length, depth, chunks
+if resumed then
+  length, depth, chunks = resumed.length, resumed.depth, resumed.chunks
+  run_seq = resumed.seq
+else
+  term.clear()
+  term.setCursorPos(1, 1)
+  print("=== Chunk Quarry Control ===")
+  print("(press ENTER to keep the value in brackets)")
+  length = ask("Chunk length (blocks per lane)", saved[1])
+  depth = ask("Depth (layers to mine down)", saved[2])
+  chunks = ask("Chunks to mine (0 = until stopped)", saved[3])
+
+  local f = fs.open(SETTINGS_FILE, "w")
+  f.write(length .. "\n" .. depth .. "\n" .. chunks .. "\n")
+  f.close()
+end
 
 local PASSES = math.ceil(depth / 3) -- miners clear 3 layers per pass
 
@@ -88,6 +129,37 @@ local service = { state = "not heard from yet" }
 local log_lines = {}
 local program_start = os.clock()
 local confirm_stop_until = 0
+
+-- Saves everything needed to carry on after a restart. Called after every
+-- change to the run.
+local function save_run()
+  run_seq = run_seq + 1
+  local lanes = {}
+  for lane, m in pairs(miners) do lanes[lane] = { id = m.id, home = m.home } end
+  local f = fs.open(RUN_FILES[run_seq % 2 + 1], "w")
+  f.write(textutils.serialize({
+    seq = run_seq, length = length, depth = depth, chunks = chunks,
+    started = started, elapsed = started_at and (os.clock() - started_at) or 0,
+    current_chunk = current_chunk, stop_requested = stop_requested,
+    finished = finished, last_chunk = last_chunk,
+    lanes = lanes, done = done, stopped = stopped,
+  }))
+  f.close()
+end
+
+if resumed then
+  started, current_chunk = resumed.started, resumed.current_chunk
+  stop_requested, finished = resumed.stop_requested, resumed.finished
+  last_chunk = resumed.last_chunk
+  if started then started_at = os.clock() - (resumed.elapsed or 0) end
+  done, stopped = resumed.done or {}, resumed.stopped or {}
+  for lane, l in pairs(resumed.lanes or {}) do
+    miners[lane] = {
+      id = l.id, home = l.home,
+      status = l.home and "finished" or (started and "restarted, waiting" or "registered"),
+    }
+  end
+end
 
 local function sorted_lanes()
   local lanes = {}
@@ -146,6 +218,7 @@ local function status_color(s)
     return colors.red
   end
   if s:find("^mining") or s:find("work") then return colors.lime end
+  if s:find("resum") or s:find("restarted") or s:find("finding") then return colors.purple end
   if s:find("service") or s:find("unloading") then return colors.yellow end
   if s:find("done") then return colors.cyan end
   if s:find("^to chunk") or s:find("^going") then return colors.lightBlue end
@@ -281,15 +354,18 @@ local function do_start()
   for _, lane in ipairs(lanes) do
     rednet.send(miners[lane].id, {
       cmd = "start", id = lane, length = length, depth = depth, chunks = chunks,
+      chunk = current_chunk,
     }, PROTOCOL)
     miners[lane].status = "starting"
   end
+  save_run()
 end
 
 local function do_stop()
   if not started or stop_requested or finished then return end
   stop_requested = true
   add_log("control", "Stop requested: lanes finish their current pass and go home.")
+  save_run()
 end
 
 local function draw_monitor()
@@ -484,6 +560,7 @@ local function tell_stop(lane)
   if not stopped[lane] then
     stopped[lane] = true
     miners[lane].status = "stopped, going home"
+    save_run()
   end
 end
 
@@ -497,10 +574,11 @@ end
 local function check_all_home()
   if all_home or not next(miners) then return end
   for _, m in pairs(miners) do
-    if m.status ~= "finished" then return end
+    if not m.home then return end
   end
   all_home = true
-  add_log("control", "All lanes are home. Stop the service turtle with Ctrl+T.")
+  clear_run() -- the run is over: next boot starts fresh
+  add_log("control", "All lanes are home. The next run starts with ENTER or START.")
 end
 
 -- Called when a lane reports chunk_done: if everyone is done, either move
@@ -527,6 +605,7 @@ local function try_advance()
       miners[lane].pass = nil
     end
   end
+  save_run()
 end
 
 local function handle(sender, msg)
@@ -540,14 +619,19 @@ local function handle(sender, msg)
         add_log("control", "Two turtles claim lane " .. lane .. "! Check their lane numbers.")
       end
       if not m then add_log("control", "Lane " .. lane .. " registered.") end
+      local changed = not m or m.id ~= sender
       miners[lane] = m or {}
       miners[lane].id = sender
       miners[lane].status = "registered"
       miners[lane].seen = os.clock()
       send(lane, { cmd = "registered", id = lane })
-    elseif m and m.id == sender then
-      -- it missed the first start message
-      send(lane, { cmd = "start", id = lane, length = length, depth = depth, chunks = chunks })
+      if changed then save_run() end
+    elseif m and m.id == sender and not finished then
+      -- it missed the start message, or was reset with "here": (re)join
+      -- the run at the current chunk
+      m.home = nil
+      send(lane, { cmd = "start", id = lane, length = length, depth = depth,
+        chunks = chunks, chunk = current_chunk })
     end
     return
   end
@@ -571,7 +655,10 @@ local function handle(sender, msg)
       last_chunk = true
       add_log("control", "No loader for the next chunk, so this chunk is the last one.")
     end
-    done[lane] = math.max(done[lane] or 0, msg.chunk)
+    if (done[lane] or 0) < msg.chunk then
+      done[lane] = msg.chunk
+      save_run()
+    end
     m.chunk = msg.chunk
     if finished or stop_requested then
       tell_stop(lane)
@@ -600,6 +687,10 @@ local function handle_status(sender, msg)
     if m and m.id == sender then
       m.seen = os.clock()
       if msg.state then m.status = msg.state end
+      if msg.state == "finished" and not m.home then
+        m.home = true
+        save_run()
+      end
     end
     if msg.text then add_log("lane " .. msg.id, msg.text) end
     check_all_home()
@@ -647,8 +738,15 @@ local function ui_loop()
 end
 
 find_monitor()
-add_log("control", string.format("Controller ready (length %d, depth %d, %s). Waiting for lanes.",
-  length, depth, chunks == 0 and "until stopped" or (chunks .. " chunks")))
+if resumed and started then
+  add_log("control", "Restarted: resuming the run at chunk " .. current_chunk .. ".")
+  check_all_home()
+elseif resumed then
+  add_log("control", "Restarted: kept the lanes registered before the restart.")
+else
+  add_log("control", string.format("Controller ready (length %d, depth %d, %s). Waiting for lanes.",
+    length, depth, chunks == 0 and "until stopped" or (chunks .. " chunks")))
+end
 if not mon then add_log("control", "No monitor found - attach an Advanced Monitor for the dashboard.") end
 term.clear()
 draw_all(true)
