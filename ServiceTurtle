@@ -11,7 +11,8 @@
 --   * FUEL chest directly BELOW the home spot. Put ONLY fuel in it, and
 --     only one kind. Best: COAL BLOCKS (800 fuel each, ten times coal). Keep some fuel in it: after a restart
 --     the turtle finds home by the chests above and below it.
---   * Recommended: any solid block directly IN FRONT of the home spot.
+--   * REQUIRED: any solid block directly IN FRONT of the home spot. Every
+--     time it's home the turtle looks at it to check which way it faces.
 --   * Clear the row the service turtle drives along (home spot + the 16
 --     blocks to its right) -- it will dig that row if needed, but never
 --     digs inside the lanes, so it can't destroy a mining turtle.
@@ -407,8 +408,10 @@ local function burn_one_fuel()
   return false
 end
 
--- Hands `count` fuel items to the turtle in front of us.
+-- Hands `count` fuel items to the turtle in front of us (only if there is
+-- something in front of us: never onto the ground).
 local function hand_over_fuel(count)
+  if not turtle.detect() then return end
   for slot = 16, FIRST_FUEL_SLOT, -1 do
     if count <= 0 then break end
     local n = math.min(count, turtle.getItemCount(slot))
@@ -437,6 +440,20 @@ local function restock()
     else
       report("can't get home", "Can't get home -- something is in the way. Retrying...")
       sleep(5)
+    end
+  end
+
+  -- Check which way we face against the block in front of home: solid
+  -- ahead = facing forward, open = facing along the row. Our notes can be
+  -- wrong if we were picked up and put back, and a wrong facing would send
+  -- us digging off in the wrong direction.
+  if P.front_solid then
+    local actual = turtle.detect() and 0 or 1
+    if actual ~= P.facing then
+      report(nil, "My notes said I faced " .. (P.facing == 0 and "forward" or "along the row")
+        .. ", but I don't: corrected.")
+      P.facing = actual
+      save()
     end
   end
 
@@ -646,9 +663,13 @@ if saved then
   end
 end
 if not saved then
-  -- fresh start on the home spot, facing forward: note whether the block in
-  -- front is solid (see the first-turn case above)
-  P.front_solid = turtle.detect()
+  -- fresh start on the home spot, facing forward: the block in front of
+  -- home is how we check our facing from now on
+  while not turtle.detect() do
+    report("NO BLOCK IN FRONT", "Put any solid block directly in front of my home spot (I face it: the same way as the miners).")
+    sleep(10)
+  end
+  P.front_solid = true
 end
 save()
 restock()
