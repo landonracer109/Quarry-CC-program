@@ -1,152 +1,201 @@
--- quarry_control.lua
+-- quarry_control (control computer) -- ComputerCraft 1.63
 -- Runs on a Computer (NOT a turtle) with a wireless modem attached.
--- Coordinates a fleet of turtles (running quarry_turtle.lua) to mine
--- chunk after chunk in a line: all turtles mine one chunk together,
--- then all advance to the next chunk together.
+-- Registers the mining turtles, starts them, and moves the whole fleet to
+-- the next chunk once every turtle has finished the current one.
+--
+-- Start order: service turtle, then all miners, then this.
+-- Keys: ENTER = start mining once all turtles are registered
+--       S     = stop (turtles finish their current pass and go home)
 
-local PROTOCOL = "chunkquarry"
+local PROTOCOL = "chunkquarry" -- control computer <-> miners
 
 local opened = false
-for _, side in ipairs(peripheral.getNames()) do
+for _, side in ipairs(rs.getSides()) do
   if peripheral.getType(side) == "modem" then
     rednet.open(side)
     opened = true
   end
 end
 if not opened then
-  error("No modem attached to this computer! Attach a wireless modem and rerun.")
+  error("No modem attached! Attach a wireless modem and rerun.")
 end
 
+term.clear()
+term.setCursorPos(1, 1)
 print("=== Chunk Quarry Control ===")
-io.write("Chunk length (blocks per tunnel, usually 16): ")
+io.write("Chunk length (blocks per lane, usually 16): ")
 local length = tonumber(read()) or 16
 io.write("Depth (layers to mine down): ")
 local depth = tonumber(read()) or 60
-io.write("Number of chunks to mine (0 = run until stopped): ")
+io.write("Chunks to mine (0 = until stopped): ")
 local chunks = tonumber(read()) or 0
 
-local turtles = {} -- [laneId] = {computerId=, status=, chunk=, fuel=}
+-- State ---------------------------------------------------------------------
+local miners = {}        -- [lane] = { id=, status=, chunk=, y=, fuel= }
+local done = {}          -- [lane] = last chunk that lane finished
+local stopped = {}       -- [lane] = true once we've told it to stop
+local started = false
+local stop_requested = false
+local finished = false   -- no more chunks: answer everything with "stop"
+local current_chunk = 1
+local notice = ""
 
-local function countTurtles()
-  local n = 0
-  for _ in pairs(turtles) do n = n + 1 end
-  return n
+local function sorted_lanes()
+  local lanes = {}
+  for lane in pairs(miners) do table.insert(lanes, lane) end
+  table.sort(lanes)
+  return lanes
 end
 
-local function draw(headerExtra)
+-- The screen is 51x19, so: 1 header line, up to 16 lanes, 2 footer lines.
+local function draw()
   term.clear()
   term.setCursorPos(1, 1)
-  print("=== Chunk Quarry Control ===")
-  print("length=" .. length .. "  depth=" .. depth .. "  chunks=" .. (chunks == 0 and "infinite" or chunks))
-  print(string.rep("-", 50))
-  local ids = {}
-  for id in pairs(turtles) do table.insert(ids, id) end
-  table.sort(ids)
-  for _, id in ipairs(ids) do
-    local t = turtles[id]
-    print(string.format("Turtle %2d | chunk %3d | fuel %6s | %s",
-      id, t.chunk or 0, tostring(t.fuel or "?"), t.status or ""))
+  local header = string.format("L=%d D=%d chunk %d/%s", length, depth,
+    current_chunk, chunks == 0 and "inf" or tostring(chunks))
+  if stop_requested then header = header .. "  STOPPING" end
+  print(header)
+  for _, lane in ipairs(sorted_lanes()) do
+    local m = miners[lane]
+    print(string.format("%2d c%-3d y%-4s f%-6s %s", lane, m.chunk or 0,
+      tostring(m.y or 0), tostring(m.fuel or "?"), m.status or ""))
   end
-  print(string.rep("-", 50))
-  if headerExtra then print(headerExtra) end
+  local _, h = term.getSize()
+  term.setCursorPos(1, h - 1)
+  term.write(notice)
+  term.setCursorPos(1, h)
+  if not started then
+    term.write("ENTER = start (" .. #sorted_lanes() .. " registered)")
+  elseif finished or stop_requested then
+    term.write("Finishing up...")
+  else
+    term.write("S = stop")
+  end
 end
 
--- Phase 1: collect registrations
-draw("Power on turtles now (run: quarry_turtle <laneId> on each).")
-print("Press ENTER once all expected turtles have checked in.")
-
-local collecting = true
-parallel.waitForAny(
-  function()
-    while collecting do
-      local senderId, msg = rednet.receive(PROTOCOL, 1)
-      if msg and msg.cmd == "hello" then
-        turtles[msg.id] = turtles[msg.id] or {}
-        turtles[msg.id].computerId = senderId
-        turtles[msg.id].status = "ready"
-        draw("Press ENTER once all expected turtles have checked in.")
-      end
-    end
-  end,
-  function()
-    read()
-    collecting = false
-  end
-)
-
-if countTurtles() == 0 then
-  print("No turtles checked in. Exiting.")
-  return
+local function send(lane, msg)
+  rednet.send(miners[lane].id, msg, PROTOCOL)
 end
 
--- Phase 2: send start config to every registered turtle
-for id, t in pairs(turtles) do
-  rednet.send(t.computerId, { cmd = "start", length = length, depth = depth, chunks = chunks }, PROTOCOL)
-  t.status = "starting"
+local function start_msg(lane)
+  return { cmd = "start", id = lane, length = length, depth = depth }
 end
 
--- Phase 3: monitor, advance chunks, allow early stop
-local currentChunk = 1
-local doneThisChunk = {}
-local running = true
+local function tell_stop(lane)
+  send(lane, { cmd = "stop", id = lane })
+  stopped[lane] = true
+  miners[lane].status = "stopped"
+end
 
-parallel.waitForAny(
-  function()
-    while running do
-      local senderId, msg = rednet.receive(PROTOCOL, 2)
-      if msg then
-        -- allow late-joining turtles too
-        turtles[msg.id] = turtles[msg.id] or { status = "ready" }
-        local t = turtles[msg.id]
-        t.computerId = senderId
+local function all_stopped()
+  for lane in pairs(miners) do
+    if not stopped[lane] then return false end
+  end
+  return true
+end
 
-        if msg.cmd == "progress" then
-          t.chunk = msg.chunk
-          t.fuel = msg.fuel
-          t.status = "mining layer " .. tostring(msg.layer)
-        elseif msg.cmd == "chunk_done" then
-          t.status = "chunk " .. msg.chunk .. " done, waiting"
-          doneThisChunk[msg.id] = msg.chunk
-        elseif msg.cmd == "error" then
-          t.status = "ERROR: " .. tostring(msg.msg)
-        end
-      end
-
-      local allDone, count = true, 0
-      for id in pairs(turtles) do
-        count = count + 1
-        if doneThisChunk[id] ~= currentChunk then allDone = false end
-      end
-
-      if allDone and count > 0 then
-        if chunks ~= 0 and currentChunk >= chunks then
-          for id, t in pairs(turtles) do
-            rednet.send(t.computerId, { cmd = "stop" }, PROTOCOL)
-          end
-          running = false
-        else
-          for id, t in pairs(turtles) do
-            rednet.send(t.computerId, { cmd = "next_chunk" }, PROTOCOL)
-            t.status = "advancing to chunk " .. (currentChunk + 1)
-          end
-          currentChunk = currentChunk + 1
-        end
-      end
-
-      draw("Chunk " .. currentChunk .. " in progress. Type 's' + ENTER to stop early.")
-    end
-  end,
-  function()
-    while running do
-      local line = read()
-      if line == "s" then
-        for id, t in pairs(turtles) do
-          rednet.send(t.computerId, { cmd = "stop" }, PROTOCOL)
-        end
-        running = false
-      end
+-- Called when a lane reports chunk_done: if everyone is done, either move
+-- the fleet to the next chunk or finish.
+local function try_advance()
+  for lane in pairs(miners) do
+    if (done[lane] or 0) < current_chunk then return end
+  end
+  if stop_requested or (chunks ~= 0 and current_chunk >= chunks) then
+    finished = true
+    for lane in pairs(miners) do tell_stop(lane) end
+  else
+    current_chunk = current_chunk + 1
+    for lane in pairs(miners) do
+      send(lane, { cmd = "next_chunk", id = lane, chunk = current_chunk })
+      miners[lane].status = "to chunk " .. current_chunk
     end
   end
-)
+end
 
-draw("All done / stopped.")
+local function handle(sender, msg)
+  if type(msg) ~= "table" or type(msg.id) ~= "number" then return end
+  local lane = msg.id
+  local m = miners[lane]
+
+  if msg.cmd == "hello" then
+    if not started then
+      if m and m.id ~= sender then
+        notice = "Two turtles claim lane " .. lane .. "! Check IDs."
+      end
+      miners[lane] = m or {}
+      miners[lane].id = sender
+      miners[lane].status = "registered"
+      send(lane, { cmd = "registered", id = lane })
+    elseif m and m.id == sender then
+      send(lane, start_msg(lane)) -- it missed the first start message
+    end
+    return
+  end
+
+  -- everything else must come from a registered turtle
+  if not m or m.id ~= sender then return end
+
+  if msg.cmd == "progress" then
+    m.chunk, m.y, m.fuel = msg.chunk, msg.y, msg.fuel
+    if stop_requested or finished then
+      tell_stop(lane)
+    else
+      m.status = "mining pass " .. tostring(msg.pass)
+      send(lane, { cmd = "go", id = lane })
+    end
+  elseif msg.cmd == "chunk_done" then
+    done[lane] = math.max(done[lane] or 0, msg.chunk)
+    m.chunk = msg.chunk
+    if finished or stop_requested then
+      tell_stop(lane)
+    elseif msg.chunk < current_chunk then
+      -- it missed the next_chunk message; repeat it
+      send(lane, { cmd = "next_chunk", id = lane, chunk = current_chunk })
+    else
+      m.status = "chunk " .. msg.chunk .. " done, waiting"
+      try_advance()
+    end
+  end
+end
+
+-- Main ----------------------------------------------------------------------
+local function network_loop()
+  while true do
+    local sender, msg = rednet.receive(PROTOCOL, 1)
+    if msg then handle(sender, msg) end
+    if started and next(miners) and all_stopped() then return end
+    draw()
+  end
+end
+
+local function key_loop()
+  while true do
+    local event, key = os.pullEvent("key")
+    if key == keys.enter and not started then
+      if next(miners) then
+        started = true
+        notice = ""
+        for lane, m in pairs(miners) do
+          send(lane, start_msg(lane))
+          m.status = "starting"
+        end
+      else
+        notice = "No turtles registered yet."
+      end
+      draw()
+    elseif key == keys.s and started and not stop_requested then
+      stop_requested = true
+      notice = "Stop requested."
+      draw()
+    end
+  end
+end
+
+draw()
+parallel.waitForAny(network_loop, key_loop)
+
+term.clear()
+term.setCursorPos(1, 1)
+print("All turtles told to stop. They'll return to their")
+print("starting spots. Stop the service turtle (Ctrl+T)")
+print("once they're all home.")
