@@ -16,7 +16,8 @@
 local args = { ... }
 local LANE = tonumber(args[1])
 if not LANE then
-  print("Usage: quarry_turtle <laneId>")
+  local name = shell and shell.getRunningProgram() or "quarry_turtle"
+  print("Usage: " .. name .. " <laneId>   (lane 0..15)")
   return
 end
 
@@ -69,43 +70,61 @@ local function fuel_level()
 end
 
 -- Movement ------------------------------------------------------------------
+-- Turtles never attack: CC 1.63 can't tell a mob from a player, so when a
+-- non-block is in the way (mob, player, falling sand) we just wait for it
+-- to move.
+local function wait_for_entity(warned)
+  if not warned then print("Something is in my way. Waiting for it to move...") end
+  sleep(1)
+  return true
+end
+
 -- Moves, digging whatever is in the way. Only used where no other turtle
 -- can ever be: ahead of us in our own lane, or straight up/down.
-local function dig_move(move, dig, detect, attack)
-  local failed_digs = 0
-  for _ = 1, 50 do
+local function dig_move(move, dig, detect)
+  local failed_digs, digs, warned = 0, 0, false
+  while true do
     if move() then return true end
+    if turtle.getFuelLevel() == 0 then
+      print("Out of fuel!")
+      return false
+    end
     if detect() then
       if dig() then
         failed_digs = 0
+        digs = digs + 1
+        if digs > 50 then return false end -- endless gravel? give up
       else
         failed_digs = failed_digs + 1
-        if failed_digs >= UNBREAKABLE_TRIES then return false end
+        if failed_digs >= UNBREAKABLE_TRIES then return false end -- bedrock
       end
     else
-      attack() -- mob in the way
+      warned = wait_for_entity(warned)
     end
     sleep(0.3)
   end
-  return false
 end
 
 -- Moves WITHOUT digging. Used when heading back along the surface row,
 -- which is already mined and where the service turtle may be parked
 -- (turtles CAN dig other turtles in CC 1.63, and turtle.inspect doesn't
 -- exist until 1.64, so we can't check what's in front of us).
-local function safe_move(move, detect, attack)
+local function safe_move(move, detect)
   local warned = false
   while not move() do
+    if turtle.getFuelLevel() == 0 then
+      print("Out of fuel!")
+      return false
+    end
     if detect() then
       if not warned then
         print("Something is blocking my way back. Waiting...")
         warned = true
       end
+      sleep(1)
     else
-      attack()
+      warned = wait_for_entity(warned)
     end
-    sleep(1)
   end
   return true
 end
@@ -120,7 +139,7 @@ end
 
 local function forward()
   face(0)
-  if dig_move(turtle.forward, turtle.dig, turtle.detect, turtle.attack) then
+  if dig_move(turtle.forward, turtle.dig, turtle.detect) then
     z = z + 1
     return true
   end
@@ -129,21 +148,21 @@ end
 
 local function back()
   face(2)
+  local moved
   if y < 0 then
     -- below the surface: the service turtle never comes down here
-    if not dig_move(turtle.forward, turtle.dig, turtle.detect, turtle.attack) then
-      return false
-    end
+    moved = dig_move(turtle.forward, turtle.dig, turtle.detect)
   else
     -- surface row: already mined, and the service turtle may be parked in it
-    safe_move(turtle.forward, turtle.detect, turtle.attack)
+    moved = safe_move(turtle.forward, turtle.detect)
   end
+  if not moved then return false end
   z = z - 1
   return true
 end
 
 local function up()
-  if dig_move(turtle.up, turtle.digUp, turtle.detectUp, turtle.attackUp) then
+  if dig_move(turtle.up, turtle.digUp, turtle.detectUp) then
     y = y + 1
     return true
   end
@@ -151,7 +170,7 @@ local function up()
 end
 
 local function down()
-  if dig_move(turtle.down, turtle.digDown, turtle.detectDown, turtle.attackDown) then
+  if dig_move(turtle.down, turtle.digDown, turtle.detectDown) then
     y = y - 1
     return true
   end

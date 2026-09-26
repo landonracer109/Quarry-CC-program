@@ -74,10 +74,17 @@ end
 -- One step forward. Digs only when allow_dig is true (the home row, where
 -- no mining turtle ever goes). Inside lanes it waits instead, because the
 -- only solid thing there could be a turtle -- and turtles CAN dig turtles.
+-- Never attacks: CC 1.63 can't tell a mob from a player, so it waits for
+-- anything that isn't a block to move out of the way.
 local function forward(allow_dig)
   local failed_digs = 0
   local waited = 0
+  local warned_entity = false
   while not turtle.forward() do
+    if turtle.getFuelLevel() == 0 then
+      print("Out of fuel!")
+      return false
+    end
     if turtle.detect() then
       if allow_dig then
         if turtle.dig() then
@@ -93,7 +100,11 @@ local function forward(allow_dig)
         sleep(1)
       end
     else
-      turtle.attack() -- mob in the way
+      if not warned_entity then
+        print("Something is in my way. Waiting for it to move...")
+        warned_entity = true
+      end
+      sleep(1)
     end
     sleep(0.3)
   end
