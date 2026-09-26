@@ -37,6 +37,7 @@ local stopped = {}       -- [lane] = true once we've told it to stop
 local started = false
 local stop_requested = false
 local finished = false   -- no more chunks: answer everything with "stop"
+local last_chunk = false -- lane 0 is out of loaders: end after this chunk
 local current_chunk = 1
 local notice = ""
 
@@ -78,7 +79,7 @@ local function send(lane, msg)
 end
 
 local function start_msg(lane)
-  return { cmd = "start", id = lane, length = length, depth = depth }
+  return { cmd = "start", id = lane, length = length, depth = depth, chunks = chunks }
 end
 
 local function tell_stop(lane)
@@ -100,7 +101,7 @@ local function try_advance()
   for lane in pairs(miners) do
     if (done[lane] or 0) < current_chunk then return end
   end
-  if stop_requested or (chunks ~= 0 and current_chunk >= chunks) then
+  if stop_requested or last_chunk or (chunks ~= 0 and current_chunk >= chunks) then
     finished = true
     for lane in pairs(miners) do tell_stop(lane) end
   else
@@ -144,6 +145,12 @@ local function handle(sender, msg)
       send(lane, { cmd = "go", id = lane })
     end
   elseif msg.cmd == "chunk_done" then
+    if msg.no_next_loader and not last_chunk then
+      -- lane 0 couldn't load the next chunk, so nobody may drive into it:
+      -- let everyone finish this chunk, then end the run
+      last_chunk = true
+      notice = "No loader for next chunk - this is the last one."
+    end
     done[lane] = math.max(done[lane] or 0, msg.chunk)
     m.chunk = msg.chunk
     if finished or stop_requested then
