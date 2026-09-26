@@ -198,6 +198,27 @@ end
 
 -- Moves, digging whatever is in the way. Only used where no other turtle
 -- can ever be: ahead of us in our own lane, or straight up/down.
+local burn_fuel -- (defined with the inventory code below)
+
+-- Out of fuel: burn any fuel we carry; if there's none, wait right here
+-- until someone puts some in us (down in the tunnel the service turtle
+-- can't reach us). Never give up: a failed move would be taken for bedrock.
+local function wait_for_fuel()
+  local warned = false
+  while turtle.getFuelLevel() == 0 do
+    burn_fuel()
+    if turtle.getFuelLevel() == 0 then
+      if not warned then
+        say("Out of fuel! Put fuel (e.g. coal blocks) in any of my slots 1-11.",
+          "OUT OF FUEL - refuel by hand")
+        warned = true
+      end
+      sleep(10)
+    end
+  end
+  if warned then say("Got fuel, carrying on.", "working") end
+end
+
 local function dig_move(dir, move, dig, detect)
   local failed_digs, digs, warned = 0, 0, false
   while true do
@@ -206,8 +227,7 @@ local function dig_move(dir, move, dig, detect)
       return true
     end
     if turtle.getFuelLevel() == 0 then
-      say("Out of fuel!", "OUT OF FUEL")
-      return false
+      wait_for_fuel()
     end
     if detect() then
       if dig() then
@@ -232,8 +252,7 @@ local function back()
   local warned = false
   while not try_move("b", turtle.back) do
     if turtle.getFuelLevel() == 0 then
-      say("Out of fuel!", "OUT OF FUEL")
-      return false
+      wait_for_fuel()
     end
     if not warned then
       say("Something is behind me. Waiting for it to move...", "blocked")
@@ -326,7 +345,7 @@ end
 
 -- Burns fuel from our cargo (handed over, or coal we mined), but only as
 -- much as fits in the tank: the rest stays as cargo.
-local function burn_fuel()
+function burn_fuel()
   for i = 1, 16 do
     if fuel_level() >= fuel_limit() then break end
     if is_cargo(i) and turtle.getItemCount(i) > 0 then
@@ -428,10 +447,16 @@ local function request_service()
   local rz, ry = S.z, S.y
   -- Straight up first: the column above any spot we've visited is already
   -- mined, and so is the whole y=0 row back home.
-  go_to_y(0)
-  go_to_z(0)
+  while not (S.y == 0 and S.z == 0) do
+    go_to_y(0)
+    go_to_z(0)
+    if not (S.y == 0 and S.z == 0) then sleep(5) end
+  end
   dump_junk() -- no point carrying junk to the service turtle
 
+  -- enough to get back to work, work a row, and come home again
+  local need = 2 * (math.abs(ry) + rz) + S.length + FUEL_BUFFER
+  while true do
   service_seq = service_seq + 1
   local req = {
     cmd = "service_request", id = LANE,
@@ -474,6 +499,11 @@ local function request_service()
   burn_fuel()
   tidy_slot_16()
   print("Serviced. Fuel: " .. tostring(turtle.getFuelLevel()))
+  -- never drive back down on an empty "serviced": wait here and ask again
+  if fuel_level() >= need and not inventory_nearly_full() then break end
+  say("Still not enough fuel to get back to work: waiting at home.", "waiting for fuel")
+  sleep(10)
+  end -- while
   say(nil, "back to work")
   go_to_z(rz)
   go_to_y(ry)
@@ -894,6 +924,9 @@ local function start_run()
       return false
     elseif now_fuel == S.fuel - 1 then
       apply_move(S.pending)
+    elseif S.fuel == 0 then
+      -- we had no fuel, so that move can't have happened (someone has
+      -- given us fuel by hand since)
     elseif now_fuel ~= S.fuel then
       lost("Restarted and my fuel doesn't match my notes, so I can't tell where I am.")
       return false

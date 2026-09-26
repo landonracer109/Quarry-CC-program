@@ -567,6 +567,14 @@ local function serve(job)
   end
   face(0)
 
+  -- The miner must actually be in front of us (on its start spot). If it
+  -- isn't, don't pretend to service it: it would go back to work with
+  -- nothing. It asks again later.
+  if not turtle.detect() then
+    report("idle", "Lane " .. job.id .. " isn't on its start spot, skipping for now.", false)
+    return false
+  end
+
   -- Tell the miner we're here; it answers with how many stacks it has.
   report("unloading lane " .. job.id)
   local start = os.clock()
