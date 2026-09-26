@@ -16,7 +16,8 @@
 --   Q                    = quit once every lane has been told to stop
 --
 -- "c install" makes this computer run the controller on every boot. The
--- last length/depth/chunks are remembered: just press ENTER to reuse them.
+-- last length/chunks are remembered: just press ENTER to reuse them. The
+-- miners always dig down to bedrock and report how deep that is.
 --
 -- SURVIVES SERVER RESTARTS: the run (settings, lanes, current chunk, who is
 -- done) is saved to disk, and after a restart the controller carries on
@@ -199,7 +200,8 @@ end
 -- The last settings are remembered and reused; you're only asked the
 -- first time, after "c new", or after pressing C.
 local SETTINGS_FILE = "quarry.cfg"
-local saved = { 16, 60, 0 }
+-- quarry.cfg: length, (unused: depth, from older versions), chunks
+local saved = { 16, 0, 0 }
 if fs.exists(SETTINGS_FILE) then
   local f = fs.open(SETTINGS_FILE, "r")
   for i = 1, 3 do saved[i] = tonumber(f.readLine()) or saved[i] end
@@ -246,7 +248,7 @@ if resumed then
   length, depth, chunks = resumed.length, resumed.depth, resumed.chunks
   run_seq = resumed.seq
 elseif fs.exists(SETTINGS_FILE) and not fs.exists(ASK_FILE) and OPTION ~= "new" then
-  length, depth, chunks = saved[1], saved[2], saved[3]
+  length, chunks = saved[1], saved[3]
 else
   if fs.exists(ASK_FILE) then fs.delete(ASK_FILE) end
   parallel.waitForAny(function()
@@ -255,16 +257,18 @@ else
     print("=== Chunk Quarry Control ===")
     print("(press ENTER to keep the value in brackets)")
     length = ask("Chunk length (blocks per lane)", saved[1])
-    depth = ask("Depth (layers to mine down)", saved[2])
     chunks = ask("Chunks to mine (0 = until stopped)", saved[3])
   end, deploy_server) -- keep handing out programs while you type
 
   local f = fs.open(SETTINGS_FILE, "w")
-  f.write(length .. "\n" .. depth .. "\n" .. chunks .. "\n")
+  f.write(length .. "\n0\n" .. chunks .. "\n")
   f.close()
 end
 
-local PASSES = math.ceil(depth / 3) -- miners clear 3 layers per pass
+-- depth = layers down to bedrock, as reported by the miners (nil until
+-- one has found it). Miners clear 3 layers per pass.
+local function passes() return depth and math.ceil(depth / 3) end
+local function depth_text() return depth and tostring(depth) or "?" end
 
 -- State ---------------------------------------------------------------------
 local miners = {}        -- [lane] = { id=, status=, chunk=, pass=, y=, fuel=, seen= }
@@ -457,7 +461,9 @@ end
 local function lane_progress(lane)
   local m = miners[lane]
   if all_home or (done[lane] or 0) >= current_chunk then return 1 end
-  if m.chunk == current_chunk and m.pass then return (m.pass - 1) / PASSES end
+  if m.chunk == current_chunk and m.pass and passes() then
+    return math.min((m.pass - 1) / passes(), 1)
+  end
   return 0
 end
 
@@ -501,8 +507,8 @@ local function do_start()
   started = true
   started_at = os.clock()
   local lanes = sorted_lanes()
-  add_log("control", string.format("Started %d lanes: length %d, depth %d, %s.",
-    #lanes, length, depth, chunks == 0 and "until stopped" or (chunks .. " chunks")))
+  add_log("control", string.format("Started %d lanes: length %d, down to bedrock, %s.",
+    #lanes, length, chunks == 0 and "until stopped" or (chunks .. " chunks")))
   for _, lane in ipairs(lanes) do
     rednet.send(miners[lane].id, {
       cmd = "start", id = lane, length = length, depth = depth, chunks = chunks,
@@ -555,7 +561,7 @@ local function draw_monitor()
 
   -- Settings and overall progress through the current chunk.
   local frac = chunk_progress()
-  local prefix = string.format(" Length %d  Depth %d   Chunk ", length, depth)
+  local prefix = string.format(" Length %d  Depth %s   Chunk ", length, depth_text())
   local pieces = { { prefix, colors.lightGray } }
   add_bar(t, pieces, frac, math.max(10, w - #prefix - 6))
   table.insert(pieces, { string.format(" %3d%%", math.floor(frac * 100 + 0.5)), colors.white })
@@ -582,7 +588,7 @@ local function draw_monitor()
       { pad(" " .. lane, 6), colors.white },
       { pad(m.status or "", sw), status_color(m.status) },
       { pad(m.chunk or "-", 7), colors.white },
-      { pad(m.pass and (m.pass .. "/" .. PASSES) or "-", 8), colors.white },
+      { pad(m.pass and (m.pass .. "/" .. (passes() or "?")) or "-", 8), colors.white },
     }
     if wide then
       add_bar(t, pieces, lane_progress(lane), 10)
@@ -650,7 +656,7 @@ local function draw_terminal()
   local w, h = t.getSize()
   local state, state_color = run_state()
   row(t, 1, {
-    { string.format("L=%d D=%d chunk %d/%s ", length, depth, current_chunk,
+    { string.format("L=%d D=%s chunk %d/%s ", length, depth_text(), current_chunk,
       chunks == 0 and "inf" or tostring(chunks)), colors.white },
     { state, state_color },
   })
@@ -824,6 +830,11 @@ local function handle(sender, msg)
 
   if msg.cmd == "progress" then
     m.chunk, m.pass, m.y, m.fuel = msg.chunk, msg.pass, msg.y, msg.fuel
+    if type(msg.depth) == "number" and msg.depth ~= depth then
+      depth = msg.depth
+      add_log("control", "Bedrock found: mining " .. depth .. " layers deep.")
+      save_run()
+    end
     if stop_requested or finished then
       tell_stop(lane)
     else
@@ -951,8 +962,8 @@ if resumed and started then
 elseif resumed then
   add_log("control", "Restarted: kept the lanes registered before the restart.")
 else
-  add_log("control", string.format("Controller ready (length %d, depth %d, %s). Waiting for lanes.",
-    length, depth, chunks == 0 and "until stopped" or (chunks .. " chunks")))
+  add_log("control", string.format("Controller ready (length %d, down to bedrock, %s). Waiting for lanes.",
+    length, chunks == 0 and "until stopped" or (chunks .. " chunks")))
 end
 if not mon then add_log("control", "No monitor found - attach an Advanced Monitor for the dashboard.") end
 term.clear()

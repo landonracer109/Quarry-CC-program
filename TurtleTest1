@@ -4,7 +4,9 @@
 --        m <laneId> here       forget an interrupted run ("I'm on my start
 --                              spot") -- only needed if it says it's LOST
 --
--- Mines its own 1-wide lane of the current chunk, 3 layers per pass. Each
+-- Mines its own 1-wide lane of the current chunk, 3 layers per pass, all
+-- the way down to bedrock (found by digging straight down at the start of
+-- its first chunk; bedrock is flat, so the depth is kept). Each
 -- pass digs forward from the chunk entrance to the far end (digging above
 -- and below as it goes), then backs up to the entrance and drops 3 layers.
 -- When it needs fuel or is nearly full it goes back to the chunk entrance
@@ -201,7 +203,7 @@ local function dig_move(dir, move, dig, detect)
         if digs > 50 then return false end -- endless gravel? give up
       else
         failed_digs = failed_digs + 1
-        if failed_digs >= UNBREAKABLE_TRIES then return false end -- bedrock
+        if failed_digs >= UNBREAKABLE_TRIES then return false, "bedrock" end
       end
     else
       warned = wait_for_entity(warned)
@@ -370,7 +372,7 @@ end
 local function check_in()
   rednet.send(S.controller, {
     cmd = "progress", id = LANE, chunk = S.chunk, pass = S.pass,
-    y = S.y, fuel = turtle.getFuelLevel(),
+    y = S.y, fuel = turtle.getFuelLevel(), depth = S.depth,
   }, PROTOCOL)
   local deadline = os.clock() + 2
   while os.clock() < deadline do
@@ -460,6 +462,25 @@ local function place_next_chunk_loader()
 end
 
 -- Mining --------------------------------------------------------------------
+-- Digs straight down from the chunk entrance until bedrock, and remembers
+-- how deep that is (bedrock is flat, so it's the same for every chunk).
+-- Every pass goes down this column anyway. Safe to restart: it just keeps
+-- going down from wherever we are.
+local function find_bedrock()
+  say("Digging down to find bedrock...", "finding bedrock")
+  go_to_z(S.z_base)
+  while true do
+    ensure_ok()
+    local ok, why = down()
+    if not ok and why == "bedrock" then break end
+    if not ok then sleep(1) end
+  end
+  -- we're on the lowest layer that can be mined
+  S.depth = 1 - S.y
+  save()
+  say("Bedrock is " .. (S.depth + 1) .. " blocks down.", "working")
+end
+
 local function passes_per_chunk() return math.ceil(S.depth / 3) end
 
 -- Pass p is centered on y = -1 - 3(p-1) and clears that layer plus the ones
@@ -491,6 +512,7 @@ end
 
 -- Mines the rest of the current chunk. Returns false if told to stop.
 local function mine_chunk()
+  if not S.depth then find_bedrock() end
   while S.pass <= passes_per_chunk() do
     if not check_in() then return false end
     ensure_ok()
@@ -622,7 +644,8 @@ local function start_run()
     end
     local chunk = msg.chunk or 1
     S = {
-      controller = controller, length = msg.length, depth = msg.depth,
+      -- depth: layers down to bedrock, found when we first dig down
+      controller = controller, length = msg.length, depth = nil,
       max_chunks = msg.chunks or 0, chunk = chunk,
       z_base = (chunk - 1) * msg.length, pass = 1, y = 0, z = 0,
       loaders = (LANE == 0) and turtle.getItemCount(LOADER_SLOT) or 0,
@@ -632,7 +655,7 @@ local function start_run()
     S.phase = (S.z_base > 0) and "transit" or "mining"
     save_seq = 0
     save()
-    print("Started: " .. S.length .. " long, " .. S.depth .. " deep.")
+    print("Started: " .. S.length .. " long, down to bedrock.")
     return true
   end
 
