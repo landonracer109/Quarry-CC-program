@@ -94,12 +94,84 @@ if not open_modem() then
   error("No modem attached! Attach a wireless modem and rerun.")
 end
 
--- Prints a message and sends it (plus an optional short status) to the
--- control computer's dashboard. Fire-and-forget: broadcasting never waits,
--- and a lost update only means the display is briefly out of date.
+-- Network -------------------------------------------------------------------
+-- The server allows no more than ONE rednet message per second from each
+-- computer, so every message goes through here: at most one per SEND_GAP
+-- seconds. Messages that arrive while we wait are kept for net_receive.
+-- We only broadcast until we know who to talk to.
+local SEND_GAP = 1
+local last_send = os.clock() -- (as if we had just sent: a message may have gone out just before a reboot)
+local inbox = {}
+local controller_id -- the control computer, once it has answered us
+local service_id    -- the service turtle, once it has answered us
+
+local function wait_send_gap()
+  local wait = last_send + SEND_GAP - os.clock()
+  if wait > 0 then
+    local timer = os.startTimer(wait)
+    while true do
+      local ev = { os.pullEvent() }
+      if ev[1] == "timer" and ev[2] == timer then break end
+      if ev[1] == "rednet_message" then
+        table.insert(inbox, ev)
+        if #inbox > 20 then table.remove(inbox, 1) end
+      end
+    end
+  end
+  last_send = os.clock()
+end
+
+local function net_send(id, msg, proto)
+  wait_send_gap()
+  rednet.send(id, msg, proto)
+end
+
+local function net_broadcast(msg, proto)
+  wait_send_gap()
+  rednet.broadcast(msg, proto)
+end
+
+-- Like rednet.receive(proto, timeout), but first hands out any message
+-- that arrived while we were waiting to send.
+local function net_receive(proto, timeout)
+  for i, ev in ipairs(inbox) do
+    if proto == nil or ev[4] == proto then
+      table.remove(inbox, i)
+      return ev[2], ev[3], ev[4]
+    end
+  end
+  return rednet.receive(proto, timeout)
+end
+
+-- Dashboard status: sent at most every STATUS_GAP seconds. In between, the
+-- newest state wins and log lines are bundled into the next update.
+local STATUS_GAP = 5
+local status_pending
+local last_status = -math.huge
+
+local function flush_status(force)
+  if not status_pending then return end
+  if not force and os.clock() - last_status < STATUS_GAP then return end
+  local p = status_pending
+  status_pending = nil
+  last_status = os.clock()
+  local msg = { cmd = "status", id = LANE, state = p.state, texts = p.texts }
+  local to = controller_id or (S and S.controller)
+  if to then
+    net_send(to, msg, STATUS_PROTOCOL)
+  else
+    net_broadcast(msg, STATUS_PROTOCOL)
+  end
+end
+
+-- Prints a message and passes it (plus an optional short status) on to the
+-- control computer's dashboard (see flush_status).
 local function say(text, state)
   if text then print(text) end
-  rednet.broadcast({ cmd = "status", id = LANE, text = text, state = state }, STATUS_PROTOCOL)
+  status_pending = status_pending or { texts = {} }
+  if state then status_pending.state = state end
+  if text then table.insert(status_pending.texts, text) end
+  flush_status()
 end
 
 -- IMPORTANT: a turtle throws away rednet messages that arrive while it is
@@ -308,6 +380,7 @@ local function wait_for_fuel()
           "OUT OF FUEL - refuel by hand")
         warned = true
       end
+      flush_status()
       sleep(10)
     end
   end
@@ -634,23 +707,30 @@ local function request_service(label)
   while true do
     -- re-send until acknowledged (the service turtle misses messages while
     -- moving), then only now and then in case it was restarted
-    local interval = acked and 60 or 5
+    local interval = acked and 60 or 10
     if os.clock() - last_sent >= interval then
-      rednet.broadcast(req, SERVICE_PROTOCOL)
+      req.controller = controller_id -- (so the service turtle can report straight to it)
+      if service_id then
+        net_send(service_id, req, SERVICE_PROTOCOL)
+      else
+        net_broadcast(req, SERVICE_PROTOCOL)
+      end
       if acked then say(nil, label) end
       last_sent = os.clock()
     end
+    flush_status()
 
-    local sender, msg = rednet.receive(SERVICE_PROTOCOL, 1)
+    local sender, msg = net_receive(SERVICE_PROTOCOL, 1)
     if type(msg) == "table" and msg.id == LANE
         and msg.session == session and msg.seq == req.seq then
+      service_id = sender
       if msg.cmd == "ack" then
         acked = true
       elseif msg.cmd == "arrived" then
         -- it pulls exactly this many stacks, so it never reaches the
         -- chunk loaders in slot 16 (lane 0)
         say(nil, "unloading")
-        rednet.send(sender, {
+        net_send(sender, {
           cmd = "ready", id = LANE, session = session, seq = req.seq,
           stacks = stacks_for_service(),
         }, SERVICE_PROTOCOL)
@@ -686,6 +766,7 @@ local function fuel_needed()
 end
 
 local function ensure_ok()
+  flush_status()
   if inventory_nearly_full() then
     dump_junk()
     burn_fuel() -- coal we mined: as much as fits in the tank, freeing slots
@@ -709,33 +790,35 @@ end
 -- Reports progress and asks whether to keep going. Only called while
 -- parked, so the reply isn't lost. Returns false if told to stop.
 function check_in()
-  rednet.send(S.controller, {
+  flush_status()
+  net_send(S.controller, {
     cmd = "progress", id = LANE, chunk = S.chunk, pass = S.pass,
     y = S.y, fuel = turtle.getFuelLevel(), depth = S.depth,
     trash = S.trash and true or false, -- shown as a "T" on the dashboard
   }, PROTOCOL)
   local deadline = os.clock() + 2
   while os.clock() < deadline do
-    local sender, msg = rednet.receive(PROTOCOL, math.max(deadline - os.clock(), 0.05))
+    local sender, msg = net_receive(PROTOCOL, math.max(deadline - os.clock(), 0.05))
     if sender == S.controller and type(msg) == "table" then
       if msg.cmd == "stop" then return false end
       if msg.cmd == "go" then return true end
     end
   end
-  return true -- no answer: keep mining
+  return true -- no answer (it only answers to stop us): keep mining
 end
 
 -- Reports the chunk finished and waits for "next_chunk" or "stop".
 local function wait_for_next_chunk()
   local last_sent = -math.huge
   while true do
-    if os.clock() - last_sent >= 5 then
-      rednet.send(S.controller, {
+    if os.clock() - last_sent >= 10 then
+      net_send(S.controller, {
         cmd = "chunk_done", id = LANE, chunk = S.chunk, no_next_loader = S.no_next_loader,
       }, PROTOCOL)
       last_sent = os.clock()
     end
-    local sender, msg = rednet.receive(PROTOCOL, 1)
+    flush_status()
+    local sender, msg = net_receive(PROTOCOL, 1)
     if sender == S.controller and type(msg) == "table" then
       if msg.cmd == "stop" then return false end
       if msg.cmd == "next_chunk" and msg.chunk == S.chunk + 1 then return true end
@@ -829,11 +912,12 @@ local function wait_to_collect()
     "waiting to collect loaders")
   local last_sent = -math.huge
   while true do
-    if os.clock() - last_sent >= 5 then
-      rednet.send(S.controller, { cmd = "may_collect", id = LANE }, PROTOCOL)
+    if os.clock() - last_sent >= 10 then
+      net_send(S.controller, { cmd = "may_collect", id = LANE }, PROTOCOL)
       last_sent = os.clock()
     end
-    local sender, msg = rednet.receive(PROTOCOL, 1)
+    flush_status()
+    local sender, msg = net_receive(PROTOCOL, 1)
     if sender == S.controller and type(msg) == "table"
         and msg.cmd == "collect" and msg.id == LANE then
       return
@@ -1041,22 +1125,31 @@ local function register_and_wait()
   local registered = false
   local last_hello = -math.huge
   while true do
-    -- re-send on a timer, NOT after every message we hear: other miners'
-    -- hellos arrive here too, and answering each one floods rednet
-    if os.clock() - last_hello >= 3 then
-      rednet.broadcast({ cmd = "hello", id = LANE, version = MY_VERSION }, PROTOCOL)
+    -- re-send on a timer, NOT after every message we hear. Once registered,
+    -- straight to the control computer and only now and then (it answers
+    -- only when it doesn't know us).
+    if os.clock() - last_hello >= (registered and 15 or 10) then
+      local hello = { cmd = "hello", id = LANE, version = MY_VERSION, registered = registered }
+      if registered and controller_id then
+        net_send(controller_id, hello, PROTOCOL)
+      else
+        net_broadcast(hello, PROTOCOL)
+      end
       last_hello = os.clock()
     end
-    local sender, msg, protocol = rednet.receive(nil, 1)
+    flush_status()
+    local sender, msg, protocol = net_receive(nil, 1)
     if protocol == DEPLOY_PROTOCOL and type(msg) == "table" and msg.cmd == "update_reboot" then
       say("Rebooting to install an update.", "updating")
       os.reboot()
     end
     if protocol == PROTOCOL and type(msg) == "table" and msg.id == LANE then
-      if msg.cmd == "registered" and not registered then
+      if msg.cmd == "registered" then
+        controller_id = sender
+        if not registered then print("Registered. Waiting for start...") end
         registered = true
-        print("Registered. Waiting for start...")
       elseif msg.cmd == "start" then
+        controller_id = sender
         return sender, msg
       end
     end
@@ -1070,6 +1163,7 @@ local function lost(reason)
   print("  " .. PROGRAM .. " " .. LANE .. " here")
   while true do
     say(reason, "LOST - move to start")
+    flush_status(true)
     sleep(30)
   end
 end
@@ -1182,6 +1276,18 @@ local function start_run()
     end
   end
   S.pending = nil
+  -- Our trash can isn't in slot 15? Using it costs no fuel, so a server
+  -- crash can undo part of that without our fuel telling us: if the log
+  -- shows it out since our last move, go and find it.
+  if S.trash and not S.trash_out and turtle.getItemCount(TRASH_SLOT) == 0
+      and type(now_fuel) == "number" then
+    local states = read_journal()
+    for i = #states, 1, -1 do
+      if states[i].fuel ~= now_fuel then break end
+      if states[i].trash_out then S.trash_out = states[i].trash_out end
+      if states[i].trash_free then S.trash_free = states[i].trash_free end
+    end
+  end
   save()
   if S.trash_out then pick_up_trash() end
   -- the loader go-ahead may be stale (a crash can put the others back in

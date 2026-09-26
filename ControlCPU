@@ -107,6 +107,45 @@ local function live_program(name)
   return c
 end
 
+-- Network -------------------------------------------------------------------
+-- The server allows no more than ONE rednet message per second from each
+-- computer. Everything we send goes into this queue, and sender_loop sends
+-- one per SEND_GAP seconds. A newer message of the same kind to the same
+-- computer replaces one still waiting (only the latest matters).
+local SEND_GAP = 1
+local out_queue = {}
+local last_net_send = os.clock() -- (a message may have gone out just before a reboot)
+
+-- Waits until we may send again (shared by everything that sends).
+local function net_gap_wait()
+  while os.clock() - last_net_send < SEND_GAP do
+    sleep(math.max(0, last_net_send + SEND_GAP - os.clock()))
+  end
+  last_net_send = os.clock()
+end
+
+local function queue_send(id, msg, proto)
+  for _, q in ipairs(out_queue) do
+    if q.id == id and q.proto == proto and q.msg.cmd == msg.cmd and q.msg.role == msg.role then
+      q.msg = msg
+      return
+    end
+  end
+  table.insert(out_queue, { id = id, msg = msg, proto = proto })
+end
+
+local function sender_loop()
+  while true do
+    local q = table.remove(out_queue, 1)
+    if q then
+      net_gap_wait()
+      rednet.send(q.id, q.msg, q.proto)
+    else
+      sleep(0.25)
+    end
+  end
+end
+
 local deploy_log = function() end -- becomes the dashboard log once it exists
 local missing_logged = {}
 
@@ -124,9 +163,9 @@ local function deploy_server()
           deploy_log("No '" .. name .. "' program to give " .. who .. " yet: press U to download it.")
         end
       elseif p.sum == msg.have then
-        rednet.send(sender, { cmd = "current", role = msg.role }, DEPLOY_PROTOCOL)
+        queue_send(sender, { cmd = "current", role = msg.role }, DEPLOY_PROTOCOL)
       else
-        rednet.send(sender, { cmd = "program", role = msg.role, code = p.text }, DEPLOY_PROTOCOL)
+        queue_send(sender, { cmd = "program", role = msg.role, code = p.text }, DEPLOY_PROTOCOL)
         deploy_log("Sent the newest program to " .. who .. ".")
       end
     end
@@ -187,9 +226,10 @@ local function apply_update()
     end
   end
   for _ = 1, 3 do
+    net_gap_wait()
     rednet.broadcast({ cmd = "update_reboot" }, DEPLOY_PROTOCOL)
-    sleep(1)
   end
+  sleep(1)
   os.reboot()
 end
 
@@ -303,7 +343,7 @@ else
     chunks = ask("Chunks to mine (0 = until stopped)", saved[3])
     local mined = ask("Chunks already mined, to drive past (0 = start over)", read_progress())
     write_progress(math.max(0, math.floor(mined)))
-  end, deploy_server) -- keep handing out programs while you type
+  end, deploy_server, sender_loop) -- keep handing out programs while you type
   length = CHUNK_SIZE
   skip = read_progress()
 
@@ -385,10 +425,11 @@ local function fmt_time(s)
   return string.format("%d:%02d", m, sec)
 end
 
+-- (coarse on purpose: a line that doesn't change isn't redrawn)
 local function ago(t)
   if not t then return "-" end
   local s = math.floor(os.clock() - t)
-  if s < 60 then return s .. "s" end
+  if s < 60 then return "<1m" end
   if s < 3600 then return math.floor(s / 60) .. "m" end
   return math.floor(s / 3600) .. "h"
 end
@@ -456,10 +497,13 @@ local function run_state()
 end
 
 -- Drawing helpers -------------------------------------------------------------
+local color_cache = {} -- colors each screen is set to (skip repeats)
 local function set_colors(t, fg, bg)
   if t.isColor and t.isColor() then
-    t.setTextColor(fg)
-    t.setBackgroundColor(bg)
+    local c = color_cache[t]
+    if not c then c = {}; color_cache[t] = c end
+    if c.fg ~= fg then t.setTextColor(fg); c.fg = fg end
+    if c.bg ~= bg then t.setBackgroundColor(bg); c.bg = bg end
   else
     t.setTextColor(colors.white)
     t.setBackgroundColor(colors.black)
@@ -474,9 +518,22 @@ end
 
 -- Draws one full row: `left` pieces from the left edge, `right` pieces
 -- against the right edge. A piece is { text, fg, bg }.
+-- What each screen shows now, per line: a line that hasn't changed isn't
+-- drawn again (every monitor call is sent to the players nearby).
+local row_cache = {}
+local function forget_screen(t) row_cache[t] = nil; color_cache[t] = nil end
+
 local function row(t, y, left, right, fill)
   local w = t.getSize()
   fill = fill or colors.black
+  local sig = { w, fill }
+  for _, p in ipairs(left) do sig[#sig + 1] = p[1] .. "\1" .. tostring(p[2]) .. "\1" .. tostring(p[3]) end
+  sig[#sig + 1] = "\2"
+  for _, p in ipairs(right or {}) do sig[#sig + 1] = p[1] .. "\1" .. tostring(p[2]) .. "\1" .. tostring(p[3]) end
+  sig = table.concat(sig, "\3")
+  row_cache[t] = row_cache[t] or {}
+  if row_cache[t][y] == sig then return end
+  row_cache[t][y] = sig
   local right_len = 0
   for _, p in ipairs(right or {}) do right_len = right_len + #p[1] end
   local limit = w - right_len
@@ -568,7 +625,7 @@ local function do_start()
     add_log("control", "Chunks 1-" .. skip .. " were mined before: driving past them.")
   end
   for _, lane in ipairs(lanes) do
-    rednet.send(miners[lane].id, {
+    queue_send(miners[lane].id, {
       cmd = "start", id = lane, length = length, depth = depth, chunks = last_chunk_no(),
       chunk = current_chunk, skip = skip,
     }, PROTOCOL)
@@ -598,7 +655,9 @@ local function draw_monitor()
     { string.format("  Chunk %d/%s   ", current_chunk, chunks == 0 and "inf" or tostring(last_chunk_no())), colors.white },
     { state, state_color },
   }
-  local right = { { " " .. (started_at and fmt_time(os.clock() - started_at) or "--:--") .. " ", colors.white } }
+  -- (hours and minutes only: the title isn't redrawn every second)
+  local elapsed = started_at and math.floor((os.clock() - started_at) / 60) or nil
+  local right = { { " " .. (elapsed and string.format("%dh%02dm", math.floor(elapsed / 60), elapsed % 60) or "--:--") .. " ", colors.white } }
   button = nil
   local label, bg, action
   if not started then
@@ -754,7 +813,7 @@ end
 local last_draw = -math.huge
 local last_draw_error
 local function draw_all(force)
-  if not force and os.clock() - last_draw < 0.5 then return end
+  if not force and os.clock() - last_draw < 1 then return end
   last_draw = os.clock()
   draw_terminal()
   if mon then
@@ -772,7 +831,7 @@ end
 
 -- Fleet control ---------------------------------------------------------------
 local function send(lane, msg)
-  rednet.send(miners[lane].id, msg, PROTOCOL)
+  queue_send(miners[lane].id, msg, PROTOCOL)
 end
 
 local function tell_stop(lane)
@@ -829,7 +888,7 @@ local function nudge_if_outdated(sender, role, version, who)
   if n.count >= 3 or os.clock() - n.at < 30 then return end
   n.count, n.at = n.count + 1, os.clock()
   nudges[sender] = n
-  rednet.send(sender, { cmd = "update_reboot" }, DEPLOY_PROTOCOL)
+  queue_send(sender, { cmd = "update_reboot" }, DEPLOY_PROTOCOL)
   add_log("control", "Telling " .. who .. " to reboot into the newest version.")
 end
 
@@ -897,8 +956,16 @@ local function handle(sender, msg)
       miners[lane].id = sender
       miners[lane].status = "registered"
       miners[lane].seen = os.clock()
-      send(lane, { cmd = "registered", id = lane })
+      if changed or not msg.registered then send(lane, { cmd = "registered", id = lane }) end
       if changed then save_run() end
+    elseif not m and not finished and not stop_requested then
+      -- a lane that turned up after START (e.g. still fetching its
+      -- program): join the run at the current chunk
+      add_log("control", "Lane " .. lane .. " registered late: joining the run.")
+      miners[lane] = { id = sender, status = "starting", seen = os.clock() }
+      send(lane, { cmd = "start", id = lane, length = length, depth = depth,
+        chunks = last_chunk_no(), chunk = current_chunk, skip = skip })
+      save_run()
     elseif m and m.id == sender and not finished and not stop_requested and not stopped[lane] then
       -- it missed the start message, or was reset with "here": (re)join
       -- the run at the current chunk
@@ -945,7 +1012,6 @@ local function handle(sender, msg)
       tell_stop(lane)
     else
       m.status = "mining pass " .. tostring(msg.pass)
-      send(lane, { cmd = "go", id = lane })
     end
   elseif msg.cmd == "chunk_done" then
     if msg.no_next_loader and not last_chunk then
@@ -972,6 +1038,12 @@ local function handle(sender, msg)
   end
 end
 
+-- States a lane only ever reports while on its start spot.
+local HOME_STATES = {
+  ["home, unloading"] = true, ["waiting for service"] = true, ["unloading"] = true,
+  ["stopped, at home"] = true, ["finished"] = true,
+}
+
 -- Status updates from the miners and the service turtle (dashboard only).
 local function handle_status(sender, msg)
   if type(msg) ~= "table" then return end
@@ -980,16 +1052,17 @@ local function handle_status(sender, msg)
     service.fuel, service.stock, service.seen = msg.fuel, msg.stock, os.clock()
     service.on_row = msg.on_row
     nudge_if_outdated(sender, "service", msg.version, "the service turtle")
-    if msg.text then
-      service.last_text = msg.text
-      add_log("service", msg.text)
+    for _, text in ipairs(msg.texts or { msg.text }) do
+      service.last_text = text
+      add_log("service", text)
     end
   elseif msg.cmd == "status" and type(msg.id) == "number" then
     local m = miners[msg.id]
     if m and m.id == sender then
       m.seen = os.clock()
       if msg.state then m.status = msg.state end
-      if msg.state == "home, unloading" then m.at_home = true end
+      -- on its start spot (all servicing happens there): out of the way
+      if msg.state then m.at_home = HOME_STATES[msg.state] or nil end
       if msg.state == "finished" then
         m.confirmed = true
         if not m.home then
@@ -1007,7 +1080,9 @@ local function handle_status(sender, msg)
         end
       end
     end
-    if msg.text then add_log("lane " .. msg.id, msg.text) end
+    for _, text in ipairs(msg.texts or { msg.text }) do
+      add_log("lane " .. msg.id, text)
+    end
     check_all_home()
   end
 end
@@ -1041,6 +1116,7 @@ local function ui_loop()
         draw_all(true)
         local ok, err = download_update()
         term.clear()
+        forget_screen(term)
         if not ok then
           add_log("control", err)
         elseif started then
@@ -1088,13 +1164,15 @@ else
 end
 if not mon then add_log("control", "No monitor found - attach an Advanced Monitor for the dashboard.") end
 term.clear()
+forget_screen(term)
 draw_all(true)
-parallel.waitForAny(network_loop, ui_loop, deploy_server)
+parallel.waitForAny(network_loop, ui_loop, deploy_server, sender_loop)
 draw_all(true)
 
 term.setBackgroundColor(colors.black)
 term.setTextColor(colors.white)
 term.clear()
+forget_screen(term)
 term.setCursorPos(1, 1)
 if started and not all_stopped() then
   print("Controller closed in the middle of a run. Run it")

@@ -10,7 +10,8 @@
 -- copy it already has.
 
 local DEPLOY_PROTOCOL = "chunkdeploy"
-local WAIT = 10 -- seconds to wait for the main computer at boot
+local WAIT = 40 -- seconds to wait for the main computer at boot (it answers
+              -- one turtle a second, so after an update some wait a while)
 
 local args = { ... }
 local role, lane = args[1], tonumber(args[2])
@@ -79,9 +80,10 @@ print("Checking the main computer for updates...")
 local got_answer = false
 local waiting_said = false
 local last_ask = -math.huge
+sleep(1) -- (a message may have gone out just before this reboot: the server allows 1 a second)
 local deadline = os.clock() + WAIT
 while true do
-  if os.clock() - last_ask >= 3 then
+  if os.clock() - last_ask >= 10 then -- (the server allows few messages)
     rednet.broadcast({ cmd = "want", role = role, lane = lane, have = have }, DEPLOY_PROTOCOL)
     last_ask = os.clock()
   end
