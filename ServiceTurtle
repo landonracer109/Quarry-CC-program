@@ -425,8 +425,19 @@ end
 local function restock()
   report("restocking at home", nil, false)
   while not go_to(0, 0) do
-    report("can't get home", "Can't get home -- something is in the way. Retrying...")
-    sleep(5)
+    if fuel_level() == 0 then
+      -- stranded with an empty tank: burn anything we have, even the last
+      -- item we were keeping for a miner
+      if burn_one_fuel() then
+        save() -- fuel changed: the saved fuel level must match again
+      else
+        report("OUT OF FUEL", "Out of fuel away from home! Put fuel in my slot 13.")
+        sleep(10)
+      end
+    else
+      report("can't get home", "Can't get home -- something is in the way. Retrying...")
+      sleep(5)
+    end
   end
 
   -- the output chest sits on top of the home spot
@@ -443,26 +454,33 @@ local function restock()
     end
   end
 
-  top_up_fuel()
-  -- once per boot, burn one item to learn what the fuel chest holds
-  -- (the fuel may have been changed, e.g. from coal to coal blocks)
-  if not fuel_measured and fuel_stock() > 1 and burn_one_fuel() then
-    fuel_measured = true
-  end
-  while fuel_level() < SELF_FUEL_TARGET and fuel_stock() > 1 do
-    if not burn_one_fuel() then
-      report("BAD FUEL", "The coal slots (13-16) hold something that isn't fuel! Only put fuel in the fuel chest.")
-      break
-    end
-  end
-  save() -- fuel changed: the saved fuel level must match again
-  top_up_fuel()
-
-  while fuel_stock() == 0 do
-    report("FUEL CHEST EMPTY", "Fuel chest is empty! Add fuel...")
-    sleep(10)
+  -- Never leave home without a full enough tank of our own, and some fuel
+  -- to hand out: if the fuel chest has run dry, wait here until it's
+  -- refilled (never go out on our last scraps and get stranded).
+  local warned = false
+  while true do
     top_up_fuel()
+    -- once per boot, burn one item to learn what the fuel chest holds
+    -- (the fuel may have been changed, e.g. from coal to coal blocks)
+    if not fuel_measured and fuel_stock() > 1 and burn_one_fuel() then
+      fuel_measured = true
+    end
+    while fuel_level() < SELF_FUEL_TARGET and fuel_stock() > 0 do
+      if not burn_one_fuel() then
+        report("BAD FUEL", "The fuel slots (13-16) hold something that isn't fuel! Only put fuel in the fuel chest.")
+        break
+      end
+    end
+    save() -- fuel changed: the saved fuel level must match again
+    top_up_fuel()
+    if fuel_level() >= SELF_FUEL_TARGET and fuel_stock() > 0 then break end
+    if not warned then
+      report("FUEL CHEST EMPTY", "Fuel chest is empty! Waiting at home until it's refilled...")
+      warned = true
+    end
+    sleep(10)
   end
+  if warned then report("restocking at home", "Fuel chest refilled.") end
 
   turtle.select(1)
 end
