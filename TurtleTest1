@@ -182,6 +182,13 @@ local function clear_above_below(bottom)
 end
 
 -- Inventory -----------------------------------------------------------------
+local function has_cargo()
+  for i = 1, 16 do
+    if is_cargo(i) and turtle.getItemCount(i) > 0 then return true end
+  end
+  return false
+end
+
 local function inventory_full()
   for i = 1, 16 do
     if is_cargo(i) and turtle.getItemCount(i) == 0 then return false end
@@ -398,6 +405,10 @@ while true do
   go_to_y(0)
   go_to_z(z_base)
   face(0)
+
+  -- Hand over everything we mined this chunk (also on the last chunk, or
+  -- after a stop), so no miner finishes with a full inventory.
+  if has_cargo() then request_service() end
 
   if not keep_going or not wait_for_next_chunk() then break end
 
