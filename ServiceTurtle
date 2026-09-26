@@ -1,7 +1,7 @@
 -- quarry_service (service turtle) -- ComputerCraft 1.63
--- Run on ONE dedicated turtle. It shuttles between the mining turtles,
--- pulling out their mined blocks and handing them fuel, so the miners never
--- need their own chests.
+-- Run on ONE dedicated turtle. It drives along the home row behind the
+-- mining turtles (they come home when they need it), pulling out their
+-- mined blocks and handing them fuel, so the miners never need chests.
 --
 -- SETUP (stand behind the miners, looking the way they face):
 --   * HOME spot: one block BEHIND lane 0's start and one block to its LEFT.
@@ -9,7 +9,7 @@
 --   * OUTPUT chest directly ABOVE the home spot (mined blocks go here;
 --     pipe them out of it to bigger storage).
 --   * FUEL chest directly BELOW the home spot. Put ONLY fuel in it, and
---     only one kind (e.g. all coal). Keep some fuel in it: after a restart
+--     only one kind. Best: COAL BLOCKS (800 fuel each, ten times coal). Keep some fuel in it: after a restart
 --     the turtle finds home by the chests above and below it.
 --   * Recommended: any solid block directly IN FRONT of the home spot.
 --   * Clear the row the service turtle drives along (home spot + the 16
@@ -21,7 +21,7 @@
 --          s here      "I'm on my home spot" -- only needed if it says LOST
 --   * Home must stay chunk-loaded (control computer + both chests).
 --
--- INVENTORY: slots 1-12 = mined blocks, slots 13-16 = coal for the miners
+-- INVENTORY: slots 1-12 = mined blocks, slots 13-16 = fuel for the miners
 -- (filled automatically from the fuel chest). It only goes home when it
 -- has no room for the next load, runs low on coal, or has been idle for
 -- 30 seconds.
@@ -83,22 +83,40 @@ if not open_modem() then
 end
 
 -- Config --------------------------------------------------------------------
--- Inventory: slots 1-12 carry mined blocks, slots 13-16 carry coal for the
--- miners (4 stacks = 256 coal = 16 deliveries between trips home).
+-- Inventory: slots 1-12 carry mined blocks, slots 13-16 carry fuel for the
+-- miners (4 stacks of coal blocks = about 50 top-ups between refills).
 local CARGO_SLOTS = 12
 local FIRST_FUEL_SLOT = 13
-local FUEL_BATCH = 16       -- fuel items handed to a miner per visit (16 coal = 1280 moves)
-local MINER_FUEL_TARGET = 1500 -- only hand over fuel if the miner has less than this
-local SELF_FUEL_TARGET = 2000
-local LOW_STOCK = FUEL_BATCH * 4 -- when idle, go home to refill below this
+local SELF_FUEL_TARGET = 1000  -- we only drive along the home row
+local MAX_HANDOVER = 64        -- fuel items per visit, at most
 local IDLE_HOME_AFTER = 30  -- seconds with nothing to do before going home
 local HANDSHAKE_TIMEOUT = 60
 local UNBREAKABLE_TRIES = 5
+
+local P -- our position and fuel notes (see Position below)
 
 local function fuel_stock()
   local n = 0
   for slot = FIRST_FUEL_SLOT, 16 do n = n + turtle.getItemCount(slot) end
   return n
+end
+
+-- Fuel one item gives: coal 80, coal block 800, blaze rod 120. Measured
+-- every time we burn one ourselves (see burn_one_fuel).
+local function fuel_per_item()
+  return (P and P.per_item) or 80
+end
+
+-- Fuel items that fit into a miner with `fuel`, whose tank holds `limit`
+-- (it reports both): miners are filled right up.
+local function items_for(fuel, limit)
+  local room = (limit or 20000) - fuel
+  return math.max(0, math.min(MAX_HANDOVER, math.floor(room / fuel_per_item())))
+end
+
+-- when idle, go home to refill below this
+local function low_stock()
+  return fuel_stock() < 2 * MAX_HANDOVER
 end
 
 local function fuel_level()
@@ -111,7 +129,6 @@ end
 -- Status updates for the control computer's display. Fire-and-forget:
 -- broadcasting never waits, and a lost update only means a stale display.
 local queue = {}   -- FIFO of service jobs (see Requests below)
-local P            -- our position (see Position below)
 local status = { state = "starting up", lane = false }
 local last_report = 0
 
@@ -374,11 +391,15 @@ end
 
 -- Burns ONE fuel item from the stock (never a whole stack, so there's
 -- always some left to deliver).
+local fuel_measured = false -- fuel per item measured since this boot
 local function burn_one_fuel()
   for slot = 16, FIRST_FUEL_SLOT, -1 do
     if turtle.getItemCount(slot) > 0 then
       turtle.select(slot)
+      local before = turtle.getFuelLevel()
       local ok = turtle.refuel(1)
+      local gain = turtle.getFuelLevel() - before
+      if ok and gain > 0 then P.per_item = gain end
       turtle.select(1)
       return ok
     end
@@ -423,7 +444,12 @@ local function restock()
   end
 
   top_up_fuel()
-  while fuel_level() < SELF_FUEL_TARGET and fuel_stock() > FUEL_BATCH do
+  -- once per boot, burn one item to learn what the fuel chest holds
+  -- (the fuel may have been changed, e.g. from coal to coal blocks)
+  if not fuel_measured and fuel_stock() > 1 and burn_one_fuel() then
+    fuel_measured = true
+  end
+  while fuel_level() < SELF_FUEL_TARGET and fuel_stock() > 1 do
     if not burn_one_fuel() then
       report("BAD FUEL", "The coal slots (13-16) hold something that isn't fuel! Only put fuel in the fuel chest.")
       break
@@ -473,7 +499,8 @@ local function handle_message(sender, msg)
     queued[msg.id] = key
     table.insert(queue, {
       id = msg.id, session = msg.session, seq = msg.seq,
-      z = msg.z, fuel = msg.fuel, stacks = msg.stacks, sender = sender, key = key,
+      z = msg.z, fuel = msg.fuel, limit = msg.limit, stacks = msg.stacks,
+      sender = sender, key = key,
     })
     print("Queued lane " .. msg.id)
     report()
@@ -483,14 +510,15 @@ end
 
 local function serve(job)
   local trip = 2 * (job.id + 1 + job.z) + 20
-  -- ("unlimited" fuel comes through as a string: no delivery needed)
-  local needs_fuel = type(job.fuel) == "number" and job.fuel < MINER_FUEL_TARGET
+  -- ("unlimited" fuel comes through as a string: nothing to hand over)
+  local handover = type(job.fuel) == "number" and items_for(job.fuel, job.limit) or 0
+  local needs_fuel = handover > 0
   -- the miner tells us how many slots of blocks it will hand over
   local space_needed = math.min(job.stacks or CARGO_SLOTS, CARGO_SLOTS)
   -- only go home when we must: no room for this load, not enough coal
   -- to hand over, or not enough fuel for the trip ourselves
   if free_cargo_slots() < space_needed
-      or (needs_fuel and fuel_stock() < FUEL_BATCH)
+      or (needs_fuel and fuel_stock() < handover)
       or fuel_level() < trip then
     restock()
   end
@@ -535,7 +563,7 @@ local function serve(job)
     if not turtle.suck() then break end
   end
 
-  if needs_fuel then hand_over_fuel(FUEL_BATCH) end
+  if needs_fuel then hand_over_fuel(math.min(handover, fuel_stock())) end
 
   served[job.id] = job.key
   reply(job.sender, "serviced", job)
@@ -630,7 +658,7 @@ while true do
     idle_since = idle_since or os.clock()
     local at_home = P.sx == 0 and P.sz == 0
     if os.clock() - idle_since >= IDLE_HOME_AFTER
-        and (not at_home or not cargo_empty() or fuel_stock() < LOW_STOCK) then
+        and (not at_home or not cargo_empty() or low_stock()) then
       restock()
       print("Ready. Waiting for requests...")
       report("idle at home", nil, false)
