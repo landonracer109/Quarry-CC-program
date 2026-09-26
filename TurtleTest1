@@ -447,8 +447,11 @@ end
 -- Drives home to our start spot and waits there while the service turtle
 -- (on the home row right behind us) pulls out our blocks and hands us
 -- fuel, then returns to where we were.
+local check_in -- (defined with the control computer code below)
+
 -- `label` is the dashboard status while waiting (repeated now and then:
--- the control computer may have missed it)
+-- the control computer may have missed it). If STOP was pressed while we
+-- were home, we stay home: S.stopped is set and the caller winds down.
 local function request_service(label)
   label = label or "waiting for service"
   local rz, ry = S.z, S.y
@@ -513,6 +516,13 @@ local function request_service(label)
   say("Still not enough fuel to get back to work: waiting at home.", "waiting for fuel")
   sleep(10)
   end -- while
+  -- STOP pressed? We're home already: don't drive back out to finish the strip
+  if not S.stopped and not check_in() then
+    S.stopped = true
+    save()
+    say("Stopped: staying home.", "stopped, at home")
+  end
+  if S.stopped then return end
   say(nil, "back to work")
   go_to_z(rz)
   go_to_y(ry)
@@ -546,7 +556,7 @@ end
 -- Control computer ----------------------------------------------------------
 -- Reports progress and asks whether to keep going. Only called while
 -- parked, so the reply isn't lost. Returns false if told to stop.
-local function check_in()
+function check_in()
   rednet.send(S.controller, {
     cmd = "progress", id = LANE, chunk = S.chunk, pass = S.pass,
     y = S.y, fuel = turtle.getFuelLevel(), depth = S.depth,
@@ -728,6 +738,7 @@ local function find_bedrock()
   go_to_z(S.z_base)
   while true do
     ensure_ok()
+    if S.stopped then return end
     local ok, why = down()
     if not ok and why == "bedrock" then break end
     if not ok then sleep(1) end
@@ -760,6 +771,7 @@ local function do_pass(p)
   clear_above_below(bottom)
   while S.z < z_end do
     ensure_ok()
+    if S.stopped then return true end
     if not forward() then return false end
     clear_above_below(bottom)
   end
@@ -770,14 +782,16 @@ end
 -- Mines the rest of the current chunk. Returns false if told to stop.
 local function mine_chunk()
   if not S.depth then find_bedrock() end
-  while S.pass <= passes_per_chunk() do
+  while not S.stopped and S.pass <= passes_per_chunk() do
     if not check_in() then return false end
     ensure_ok()
+    if S.stopped then break end
     local ok = do_pass(S.pass)
+    if S.stopped then break end
     S.pass = ok and S.pass + 1 or passes_per_chunk() + 1 -- bedrock: chunk done
     save()
   end
-  return true
+  return not S.stopped
 end
 
 -- Main ----------------------------------------------------------------------
@@ -812,7 +826,7 @@ local function run()
 
     elseif S.phase == "loader" then
       ensure_fuel_for(2 * S.length + 4)
-      S.no_next_loader = not place_next_chunk_loader()
+      if not S.stopped then S.no_next_loader = not place_next_chunk_loader() end
       S.phase = "chunk_end"
       save()
 
@@ -823,10 +837,14 @@ local function run()
         S.phase = "going_home"
       else
         ensure_fuel_for(S.length)
-        S.chunk = S.chunk + 1
-        S.z_base = S.z_base + S.length
-        S.pass = 1
-        S.phase = "transit"
+        if S.stopped then
+          S.phase = "going_home"
+        else
+          S.chunk = S.chunk + 1
+          S.z_base = S.z_base + S.length
+          S.pass = 1
+          S.phase = "transit"
+        end
       end
       save()
 
