@@ -108,7 +108,10 @@ end
 local LOADER_SLOT = 16
 local FUEL_BUFFER = 20
 local UNBREAKABLE_TRIES = 5 -- failed digs in a row before we call it bedrock
-local MIN_FREE_SLOTS = 5    -- call the service turtle before we're completely full
+-- Go home to be serviced once fewer than this many cargo slots are free.
+-- One step digs at most 3 blocks (ahead, above, below), so with 3 free
+-- slots a new kind of ore always has somewhere to go.
+local MIN_FREE_SLOTS = 3
 local SAMPLE_SLOTS = { 12, 13, 14 } -- one each of the junk to throw away
 local TRASH_SLOT = 15       -- Extra Utilities Trash Can
 local LAST_FRONT_SLOT = 11  -- with a trash can, cargo the service turtle takes is in 1..11
@@ -328,8 +331,7 @@ local function tidy_slot_16()
   turtle.select(1)
 end
 
--- We call the service turtle while a few slots are still free: it carries
--- 12 stacks, so this way one visit can take everything we have.
+-- (see MIN_FREE_SLOTS)
 local function inventory_nearly_full()
   local cargo_slots = 0
   for i = 1, 16 do if is_cargo(i) then cargo_slots = cargo_slots + 1 end end
@@ -347,7 +349,9 @@ end
 -- much as fits in the tank: the rest stays as cargo.
 function burn_fuel()
   for i = 1, 16 do
-    if fuel_level() >= fuel_limit() then break end
+    -- room for any fuel item (a coal block is 800, lava 1000): burning one
+    -- into a nearly full tank would waste most of it
+    if fuel_limit() - fuel_level() < 1000 then break end
     if is_cargo(i) and turtle.getItemCount(i) > 0 then
       turtle.select(i)
       local before = fuel_level()
@@ -443,7 +447,10 @@ end
 -- Drives home to our start spot and waits there while the service turtle
 -- (on the home row right behind us) pulls out our blocks and hands us
 -- fuel, then returns to where we were.
-local function request_service()
+-- `label` is the dashboard status while waiting (repeated now and then:
+-- the control computer may have missed it)
+local function request_service(label)
+  label = label or "waiting for service"
   local rz, ry = S.z, S.y
   -- Straight up first: the column above any spot we've visited is already
   -- mined, and so is the whole y=0 row back home.
@@ -453,6 +460,7 @@ local function request_service()
     if not (S.y == 0 and S.z == 0) then sleep(5) end
   end
   dump_junk() -- no point carrying junk to the service turtle
+  tidy_slot_16() -- so the service turtle can reach it (it takes slots 1-11)
 
   -- enough to get back to work, work a row, and come home again
   local need = 2 * (math.abs(ry) + rz) + S.length + FUEL_BUFFER
@@ -464,7 +472,7 @@ local function request_service()
     fuel = turtle.getFuelLevel(), limit = fuel_limit(), stacks = stacks_for_service(),
   }
   print("Waiting for service turtle...")
-  say(nil, "waiting for service")
+  say(nil, label)
 
   local acked = false
   local last_sent = -math.huge
@@ -474,6 +482,7 @@ local function request_service()
     local interval = acked and 60 or 5
     if os.clock() - last_sent >= interval then
       rednet.broadcast(req, SERVICE_PROTOCOL)
+      if acked then say(nil, label) end
       last_sent = os.clock()
     end
 
@@ -515,8 +524,12 @@ local function fuel_needed()
 end
 
 local function ensure_ok()
-  if inventory_nearly_full() then dump_junk() end
-  if fuel_level() < fuel_needed() then burn_fuel() end -- coal we mined
+  if inventory_nearly_full() then
+    dump_junk()
+    burn_fuel() -- coal we mined: as much as fits in the tank, freeing slots
+  elseif fuel_level() < fuel_needed() then
+    burn_fuel()
+  end
   -- loop: one delivery might not be enough
   while fuel_level() < fuel_needed() or inventory_nearly_full() do
     request_service()
@@ -537,6 +550,7 @@ local function check_in()
   rednet.send(S.controller, {
     cmd = "progress", id = LANE, chunk = S.chunk, pass = S.pass,
     y = S.y, fuel = turtle.getFuelLevel(), depth = S.depth,
+    trash = S.trash and true or false, -- shown as a "T" on the dashboard
   }, PROTOCOL)
   local deadline = os.clock() + 2
   while os.clock() < deadline do
@@ -568,8 +582,9 @@ local function wait_for_next_chunk()
 end
 
 -- Chunk loaders (lane 0) --------------------------------------------------------
--- Placing is safe to repeat after a restart: whatever is already in the
--- spot (maybe the loader we just placed) is dug out first, then placed again.
+-- Placing is safe to repeat after a restart: a loader already in the spot
+-- (we were restarted right after placing it) is left there; anything else
+-- is dug out first.
 local function loaders_left()
   if turtle.getItemCount(LOADER_SLOT) == 0 then S.loaders = 0 end
   return S.loaders > 0
@@ -620,13 +635,17 @@ local function place_next_chunk_loader()
       return false
     end
   end
-  turtle.select(1)
-  if turtle.detect() then turtle.dig() end
   turtle.select(LOADER_SLOT)
-  local placed = turtle.place()
+  local placed = turtle.compare() -- already there?
+  if not placed then
+    turtle.select(1)
+    if turtle.detect() then turtle.dig() end
+    turtle.select(LOADER_SLOT)
+    placed = turtle.place()
+  end
   turtle.select(1)
+  S.loaders = turtle.getItemCount(LOADER_SLOT)
   if placed then
-    S.loaders = S.loaders - 1
     S.loader_top = S.chunk + 1 -- highest chunk with a loader in it
   end
   save()
@@ -833,9 +852,11 @@ local function run()
       go_to_y(0)
       go_to_z(0)
       if S.y == 0 and S.z == 0 then
-        -- hand everything over before we call it a day
+        -- Out of the tunnel: lane 0 may take the loaders back now, while
+        -- we hand everything over before we call it a day.
+        say(nil, "home, unloading")
         dump_junk()
-        if has_cargo() then request_service() end
+        if has_cargo() then request_service("home, unloading") end
         clear_state()
         say("Finished, back at the start.", "finished")
       else

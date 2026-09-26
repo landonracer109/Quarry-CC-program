@@ -573,6 +573,7 @@ local function do_start()
       chunk = current_chunk, skip = skip,
     }, PROTOCOL)
     miners[lane].status = "starting"
+    miners[lane].at_home = nil
   end
   save_run()
 end
@@ -643,7 +644,9 @@ local function draw_monitor()
     local m = miners[lane]
     local quiet = m.seen and os.clock() - m.seen > 300 and not all_home
     pieces = {
-      { pad(" " .. lane, 6), colors.white },
+      { pad(" " .. lane, 4), colors.white },
+      -- "T": this lane throws junk in its trash can
+      { pad(m.trash and "T" or "", 2), colors.lime },
       { pad(m.status or "", sw), status_color(m.status) },
       { pad(m.chunk or "-", 7), colors.white },
       { pad(m.pass and (m.pass .. "/" .. (passes() or "?")) or "-", 8), colors.white },
@@ -807,7 +810,7 @@ local function check_all_home()
   done, stopped = {}, {}
   stop_requested, finished, last_chunk, all_home = false, false, false, false
   for _, m in pairs(miners) do
-    m.home, m.pass, m.chunk = nil, nil, nil
+    m.home, m.at_home, m.pass, m.chunk = nil, nil, nil, nil
     m.status = "finished"
   end
 end
@@ -861,10 +864,14 @@ end
 local function may_collect(lane)
   local waiting = {}
   for other, m in pairs(miners) do
-    if other ~= lane and not m.home then table.insert(waiting, "lane " .. other) end
+    -- on its start spot (maybe still unloading) is out of the way too
+    if other ~= lane and not (m.home or m.at_home) then
+      table.insert(waiting, "lane " .. other)
+    end
   end
   table.sort(waiting)
-  if not (service.on_row and (service.queue or 0) == 0) then
+  -- the service turtle only has to be on its home row (out of the lanes)
+  if not service.on_row then
     table.insert(waiting, "the service turtle")
   end
   return #waiting == 0, waiting
@@ -892,7 +899,7 @@ local function handle(sender, msg)
     elseif m and m.id == sender and not finished and not stop_requested and not stopped[lane] then
       -- it missed the start message, or was reset with "here": (re)join
       -- the run at the current chunk
-      m.home = nil
+      m.home, m.at_home = nil, nil
       send(lane, { cmd = "start", id = lane, length = length, depth = depth,
         chunks = last_chunk_no(), chunk = current_chunk, skip = skip })
     elseif m and m.id == sender and not m.home then
@@ -923,6 +930,7 @@ local function handle(sender, msg)
     end
   elseif msg.cmd == "progress" then
     m.chunk, m.pass, m.y, m.fuel = msg.chunk, msg.pass, msg.y, msg.fuel
+    m.trash = msg.trash
     if type(msg.depth) == "number" and msg.depth ~= depth then
       depth = msg.depth
       add_log("control", "Bedrock found: mining " .. depth .. " layers deep.")
@@ -975,6 +983,7 @@ local function handle_status(sender, msg)
     if m and m.id == sender then
       m.seen = os.clock()
       if msg.state then m.status = msg.state end
+      if msg.state == "home, unloading" then m.at_home = true end
       if msg.state == "finished" and not m.home then
         m.home = true
         save_run()
