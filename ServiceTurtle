@@ -89,6 +89,7 @@ end
 local CARGO_SLOTS = 12
 local FIRST_FUEL_SLOT = 13
 local SELF_FUEL_TARGET = 1000  -- we only drive along the home row
+local SELF_FUEL_MIN = 200      -- below this (and no fuel in the chest) we wait at home
 local MAX_HANDOVER = 64        -- fuel items per visit, at most
 local IDLE_HOME_AFTER = 30  -- seconds with nothing to do before going home
 local HANDSHAKE_TIMEOUT = 60
@@ -310,19 +311,29 @@ end
 -- True if we're on the home spot: the output chest above us and the fuel
 -- chest below (the only place where sucking from below gets anything --
 -- recovery never takes us above a miner). What we pull out goes back.
+-- If the fuel chest is empty, the block in front of home tells instead.
 local function on_fuel_chest()
-  if not turtle.detectUp() then return false end
-  local slot = 16 -- a coal slot, if no slot is empty
-  for i = 1, 16 do
-    if turtle.getItemCount(i) == 0 then slot = i break end
-  end
-  turtle.select(slot)
-  local before = turtle.getItemCount(slot)
+  if not turtle.detectUp() or not turtle.detectDown() then return false end
+  local before = {}
+  for i = 1, 16 do before[i] = turtle.getItemCount(i) end
   local got = turtle.suckDown()
-  local gained = turtle.getItemCount(slot) - before
-  if gained > 0 then turtle.dropDown(gained) end
+  for i = 1, 16 do -- (it may not land in the selected slot)
+    local gained = turtle.getItemCount(i) - before[i]
+    if gained > 0 then
+      turtle.select(i)
+      turtle.dropDown(gained)
+    end
+  end
   turtle.select(1)
-  return got
+  if got then return true end
+  -- Home, facing along the row: ahead is the clear row, and facing forward
+  -- is the block in front of home. (Turning on the home spot is safe: that
+  -- block tells the two facings apart after a restart.)
+  if not P.front_solid or turtle.detect() then return false end
+  face(0)
+  local marker = turtle.detect()
+  face(1)
+  return marker
 end
 
 -- We know where we are but not which way we face (the server stopped in
@@ -425,6 +436,7 @@ end
 
 -- Goes home, empties cargo into the output chest, refuels itself and
 -- refills the coal stock.
+local chest_empty = false -- told the dashboard the fuel chest is empty
 local function restock()
   report("restocking at home", nil, false)
   while not go_to(0, 0) do
@@ -471,9 +483,10 @@ local function restock()
     end
   end
 
-  -- Never leave home without a full enough tank of our own, and some fuel
-  -- to hand out: if the fuel chest has run dry, wait here until it's
-  -- refilled (never go out on our last scraps and get stranded).
+  -- Never leave home without a full enough tank of our own: if the fuel
+  -- chest has run dry and we're low, wait here until it's refilled (never
+  -- go out on our last scraps and get stranded). With our own tank fine we
+  -- carry on unloading miners, just without fuel to hand out.
   local warned = false
   while true do
     top_up_fuel()
@@ -490,14 +503,27 @@ local function restock()
     end
     save() -- fuel changed: the saved fuel level must match again
     top_up_fuel()
-    if fuel_level() >= SELF_FUEL_TARGET and fuel_stock() > 0 then break end
+    -- full enough, or the chest is empty but we still have plenty for the
+    -- row (a trip along it is at most ~40 moves)
+    if fuel_level() >= SELF_FUEL_TARGET
+        or (fuel_stock() == 0 and fuel_level() >= SELF_FUEL_MIN) then
+      break
+    end
     if not warned then
-      report("FUEL CHEST EMPTY", "Fuel chest is empty! Waiting at home until it's refilled...")
+      report("FUEL CHEST EMPTY", "Fuel chest is empty and I'm low myself! Waiting at home until it's refilled...")
       warned = true
     end
     sleep(10)
   end
-  if warned then report("restocking at home", "Fuel chest refilled.") end
+  if fuel_stock() == 0 then
+    if not chest_empty then
+      report("FUEL CHEST EMPTY", "Fuel chest is empty: still unloading miners, but no fuel for them until it's refilled.")
+      chest_empty = true
+    end
+  elseif chest_empty or warned then
+    chest_empty = false
+    report("restocking at home", "Fuel chest refilled.")
+  end
 
   turtle.select(1)
 end
@@ -557,6 +583,13 @@ local function serve(job)
       or fuel_level() < trip then
     restock()
   end
+  -- (the fuel chest may be empty: hand over what we have, maybe nothing)
+  handover = math.min(handover, fuel_stock())
+  if space_needed == 0 and handover == 0 then
+    -- only wanted fuel and we have none: nothing to go there for (it asks
+    -- again, and we'll have fuel once the chest is refilled)
+    return false
+  end
 
   report("going to lane " .. job.id, "Servicing lane " .. job.id, job.id)
   -- lane N is N+1 blocks right of home; parking at sz = job.z puts us
@@ -606,7 +639,7 @@ local function serve(job)
     if not turtle.suck() then break end
   end
 
-  if needs_fuel then hand_over_fuel(math.min(handover, fuel_stock())) end
+  if handover > 0 then hand_over_fuel(handover) end
 
   served[job.id] = job.key
   reply(job.sender, "serviced", job)
