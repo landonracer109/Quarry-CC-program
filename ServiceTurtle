@@ -4,13 +4,17 @@
 -- mining turtles don't need their own chests.
 --
 -- SETUP:
---   * Place this turtle ONE block to the LEFT of turtle 0 (i.e. stand
---     behind the row of mining turtles, facing the same direction they'll
---     tunnel -- the service turtle goes immediately to lane 0's left).
---     It must face the SAME direction as the mining fleet.
---   * Put ONE chest directly BEHIND it -- pre-load it with fuel
---     (coal/charcoal/lava buckets/etc). Mined blocks collected from every
---     turtle in the fleet get dumped back into this same chest.
+--   * This turtle must NOT stand on the same row as the mining turtles --
+--     it travels along the row behind them, so it never collides with a
+--     parked mining turtle. To place it correctly: stand where mining
+--     turtle 0 will go, take ONE step backward (opposite the direction the
+--     fleet will tunnel), then ONE step to the left, and place the service
+--     turtle there. It must face the SAME direction as the mining fleet
+--     (i.e. facing toward where the mining turtles' row will be).
+--   * Put ONE chest directly BEHIND this turtle (one more step further
+--     back) -- pre-load it with fuel (coal/charcoal/lava buckets/etc).
+--     Mined blocks collected from every turtle in the fleet get dumped
+--     back into this same chest.
 --   * Attach a wireless modem.
 --   * Run: quarry_service
 --   * (If it seems to be reaching for the wrong lane, it was placed on the
@@ -117,12 +121,15 @@ local function checkSelf()
 end
 
 -- laneId's dock sits at physical row-offset (laneId + 1) from this turtle's
--- own start (it's placed one block to the left of lane 0).
+-- own start (it's placed one block to the left of lane 0, ONE ROW BEHIND
+-- the mining turtles' start line -- see header). Because this turtle's own
+-- z=0 is already that row behind, goToZ(zb) lands exactly one cell behind
+-- the mining turtle's dock -- never on the row the mining turtles occupy.
 local function service(laneId, zb)
   checkSelf()
   goToZ(0)
   goToX(laneId + 1)
-  goToZ(zb - 1)
+  goToZ(zb)
   face(0)
 
   for i = 1, 20 do
@@ -132,7 +139,7 @@ local function service(laneId, zb)
       goToX(0)
       checkSelf()
       goToX(laneId + 1)
-      goToZ(zb - 1)
+      goToZ(zb)
       face(0)
     end
   end
