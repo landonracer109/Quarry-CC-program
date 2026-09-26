@@ -54,11 +54,30 @@ local function face(dir)
   end
 end
 
-local function tryMove(moveFn, digFn, detectFn)
+local HAS_INSPECT = type(turtle.inspect) == "function"
+
+local function isTurtleAhead(inspectFn)
+  if not (HAS_INSPECT and inspectFn) then return false end
+  local ok, data = inspectFn()
+  if ok and data and data.name then
+    return tostring(data.name):find("turtle") ~= nil
+  end
+  return false
+end
+
+local function tryMove(moveFn, digFn, detectFn, inspectFn)
   local attempts = 0
   while not moveFn() do
     attempts = attempts + 1
-    if detectFn() then digFn() else turtle.attack() end
+    if detectFn() then
+      if isTurtleAhead(inspectFn) then
+        print("Blocked by another turtle -- stopping instead of digging through it. Check fleet alignment.")
+        return false
+      end
+      digFn()
+    else
+      turtle.attack()
+    end
     sleep(0.4)
     if attempts > 40 then return false end
   end
@@ -67,7 +86,7 @@ end
 
 local function forward()
   face(0)
-  if tryMove(turtle.forward, turtle.dig, turtle.detect) then
+  if tryMove(turtle.forward, turtle.dig, turtle.detect, turtle.inspect) then
     z = z + 1
     return true
   end
@@ -76,7 +95,7 @@ end
 
 local function back()
   face(2)
-  if tryMove(turtle.forward, turtle.dig, turtle.detect) then
+  if tryMove(turtle.forward, turtle.dig, turtle.detect, turtle.inspect) then
     z = z - 1
     return true
   end
@@ -84,7 +103,7 @@ local function back()
 end
 
 local function up()
-  if tryMove(turtle.up, turtle.digUp, turtle.detectUp) then
+  if tryMove(turtle.up, turtle.digUp, turtle.detectUp, turtle.inspectUp) then
     y = y + 1
     return true
   end
@@ -92,7 +111,7 @@ local function up()
 end
 
 local function down()
-  if tryMove(turtle.down, turtle.digDown, turtle.detectDown) then
+  if tryMove(turtle.down, turtle.digDown, turtle.detectDown, turtle.inspectDown) then
     y = y - 1
     return true
   end
