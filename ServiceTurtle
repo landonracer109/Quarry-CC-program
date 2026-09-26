@@ -65,6 +65,8 @@ end
 local STATE_FILES = { ".service_state_a", ".service_state_b" }
 if OPTION == "here" then
   for _, name in ipairs(STATE_FILES) do fs.delete(name) end
+  fs.delete(".service_log_a")
+  fs.delete(".service_log_b")
   fs.delete(".quarry_away") -- left over from older versions
   print("OK: starting fresh from the home spot.")
 end
@@ -162,6 +164,85 @@ end
 P = { sx = 0, sz = 0, facing = 0 }
 local save_seq = 0
 
+-- SERVER CRASHES: a crash puts the world back to its last autosave (up to
+-- ~45 s ago), but our files keep their newer contents. So every save is
+-- also logged, and after a restart our fuel level (1 per move) tells which
+-- logged moment the world went back to (see rewind below).
+local JOURNAL_FILES = { ".service_log_a", ".service_log_b" }
+local JOURNAL_MAX = 300
+local POS_FIELDS = { "seq", "sx", "sz", "facing", "moving", "turn_to", "fuel" }
+local journal_file, journal_lines, journal_core
+
+local function journal()
+  if type(P.fuel) ~= "number" then return end
+  if not journal_file or journal_lines >= JOURNAL_MAX then
+    journal_file = (journal_file == JOURNAL_FILES[1]) and JOURNAL_FILES[2] or JOURNAL_FILES[1]
+    local h = fs.open(journal_file, "w")
+    h.close()
+    journal_lines, journal_core = 0, nil -- each file starts with a full copy
+  end
+  local keep = {}
+  for _, k in ipairs(POS_FIELDS) do keep[k] = P[k]; P[k] = nil end
+  local core = textutils.serialize(P)
+  for _, k in ipairs(POS_FIELDS) do P[k] = keep[k] end
+  local line
+  if core ~= journal_core then
+    journal_core = core
+    line = "S " .. textutils.serialize(P):gsub("\n", " ")
+  else
+    line = "P " .. P.seq .. " " .. P.sx .. " " .. P.sz .. " " .. P.facing .. " "
+      .. (P.moving or "-") .. " " .. (P.turn_to or "-") .. " " .. P.fuel
+  end
+  local h = fs.open(journal_file, "a")
+  h.writeLine(line)
+  h.close()
+  journal_lines = journal_lines + 1
+end
+
+local function clear_journal()
+  for _, name in ipairs(JOURNAL_FILES) do fs.delete(name) end
+  journal_file = nil
+end
+
+-- Every logged state, oldest first.
+local function read_journal()
+  local states = {}
+  for _, name in ipairs(JOURNAL_FILES) do
+    if fs.exists(name) then
+      local h = fs.open(name, "r")
+      local cur
+      while true do
+        local line = h.readLine()
+        if not line then break end
+        local kind, rest = line:sub(1, 1), line:sub(3)
+        if kind == "S" then
+          local ok, t = pcall(textutils.unserialize, rest)
+          if ok and type(t) == "table" and type(t.seq) == "number" then
+            cur = t
+            table.insert(states, t)
+          end
+        elseif kind == "P" and cur then
+          local seq, sx, sz, facing, mv, tt, fuel =
+            rest:match("^(%-?%d+) (%-?%d+) (%-?%d+) (%d) (%S+) (%S+) (%-?%d+)$")
+          if seq then
+            local t = {}
+            for k, v in pairs(cur) do t[k] = v end
+            t.seq, t.sx, t.sz, t.facing = tonumber(seq), tonumber(sx), tonumber(sz), tonumber(facing)
+            t.moving = (mv ~= "-") and mv or nil
+            t.turn_to = (tt ~= "-") and tonumber(tt) or nil
+            t.fuel = tonumber(fuel)
+            cur = t
+            table.insert(states, t)
+          end
+        end
+      end
+      h.close()
+    end
+  end
+  table.sort(states, function(a, b) return a.seq < b.seq end)
+  return states
+end
+
 local function save()
   save_seq = save_seq + 1
   P.seq = save_seq
@@ -169,6 +250,7 @@ local function save()
   local f = fs.open(STATE_FILES[save_seq % 2 + 1], "w")
   f.write(textutils.serialize(P))
   f.close()
+  journal()
 end
 
 local function load_state()
@@ -404,6 +486,13 @@ end
 -- Burns ONE fuel item from the stock (never a whole stack, so there's
 -- always some left to deliver).
 local fuel_measured = false -- fuel per item measured since this boot
+
+-- A restart in the middle of burning leaves our fuel above our notes: this
+-- tells it apart from a server crash (see the startup code).
+local function start_burn()
+  P.burning = { per = P.per_item }
+  save()
+end
 local function burn_one_fuel()
   for slot = 16, FIRST_FUEL_SLOT, -1 do
     if turtle.getItemCount(slot) > 0 then
@@ -443,8 +532,11 @@ local function restock()
     if fuel_level() == 0 then
       -- stranded with an empty tank: burn anything we have, even the last
       -- item we were keeping for a miner
-      if burn_one_fuel() then
-        save() -- fuel changed: the saved fuel level must match again
+      start_burn()
+      local burned = burn_one_fuel()
+      P.burning = nil
+      save() -- fuel changed: the saved fuel level must match again
+      if burned then
       else
         report("OUT OF FUEL", "Out of fuel away from home! Put fuel in my slot 13.")
         sleep(10)
@@ -490,6 +582,7 @@ local function restock()
   local warned = false
   while true do
     top_up_fuel()
+    start_burn()
     -- once per boot, burn one item to learn what the fuel chest holds
     -- (the fuel may have been changed, e.g. from coal to coal blocks)
     if not fuel_measured and fuel_stock() > 1 and burn_one_fuel() then
@@ -501,6 +594,7 @@ local function restock()
         break
       end
     end
+    P.burning = nil
     save() -- fuel changed: the saved fuel level must match again
     top_up_fuel()
     -- full enough, or the chest is empty but we still have plenty for the
@@ -646,6 +740,62 @@ local function serve(job)
   return true
 end
 
+-- Keeps telling the dashboard (the control computer may still be booting
+-- after a restart), until someone sorts us out by hand.
+local function stay_lost(text)
+  print("Put me back on my home spot (above the fuel chest, facing")
+  print("the same way as the miners), then run:  " .. PROGRAM .. " here")
+  while true do
+    report("LOST - move home", text)
+    sleep(30)
+  end
+end
+
+-- After a server crash: find the logged moment the world went back to (the
+-- one whose fuel matches ours now) and carry on from there. Turns cost no
+-- fuel, so if we turned around then, which way we face is checked after.
+-- Returns true if found.
+local function rewind(now_fuel)
+  local states = read_journal()
+  for i = #states, 1, -1 do
+    local st = states[i]
+    local pick, facings
+    if st.fuel == now_fuel then
+      local j = i
+      while j > 1 and states[j - 1].fuel == now_fuel do j = j - 1 end
+      pick = states[j]
+      facings = {}
+      for k = j, i do
+        facings[states[k].facing] = true
+        if states[k].turn_to then facings[states[k].turn_to] = true end
+      end
+      pick.moving = nil -- (a move saved at this fuel level didn't happen)
+    elseif st.moving and st.fuel - 1 == now_fuel then
+      pick = st -- crashed just after this move
+      facings = { [st.facing] = true }
+    end
+    if pick then
+      local newest = states[#states].seq
+      P = pick
+      if P.moving then track_step(P.moving == "b" and -1 or 1) end
+      P.moving = nil
+      P.turn_to = nil
+      local n = 0
+      for _ in pairs(facings) do n = n + 1 end
+      if n > 1 then
+        -- we may or may not have turned since: sorted out below, like a
+        -- restart in the middle of a turn
+        P.turn_to = (P.facing == 0) and 1 or 0
+      end
+      save_seq = newest
+      clear_journal() -- that future never happened: start a fresh log
+      report(nil, "Server crash: went back " .. (#states - i) .. " saves to match the world.")
+      return true
+    end
+  end
+  return false
+end
+
 -- Startup -------------------------------------------------------------------
 report("starting up", "Service turtle starting up...")
 local saved = load_state()
@@ -653,24 +803,28 @@ if saved then
   P = saved
   save_seq = P.seq
   if P.recovering then
-    report("LOST - move home", "I was restarted while finding my way home and don't know where I am.")
-    print("Put me back on my home spot (above the fuel chest, facing")
-    print("the same way as the miners), then run:  " .. PROGRAM .. " here")
-    return
+    stay_lost("I was restarted while finding my way home and don't know where I am.")
   end
-  -- Did the last step before the restart happen? Every move costs 1 fuel.
-  if P.moving then
-    local now_fuel = turtle.getFuelLevel()
-    if type(now_fuel) ~= "number" or type(P.fuel) ~= "number"
-        or (now_fuel ~= P.fuel and now_fuel ~= P.fuel - 1) then
-      report("LOST - move home", "Restarted mid-move and my fuel doesn't match my notes.")
-      print("Put me back on my home spot (above the fuel chest, facing")
-      print("the same way as the miners), then run:  " .. PROGRAM .. " here")
-      return
+  -- Do our notes match the world? Every move costs exactly 1 fuel.
+  local now_fuel = turtle.getFuelLevel()
+  if type(now_fuel) ~= "number" or type(P.fuel) ~= "number" then
+    if P.moving then stay_lost("Restarted mid-move with unlimited fuel.") end
+  elseif P.moving and now_fuel == P.fuel - 1 then
+    track_step(P.moving == "b" and -1 or 1) -- the last step happened
+  elseif P.burning and now_fuel > P.fuel
+      and (not P.burning.per or (now_fuel - P.fuel) % P.burning.per == 0) then
+    -- restarted while burning fuel: our position is right
+    P.burning = nil
+  elseif now_fuel ~= P.fuel then
+    -- the world is behind our notes: a server crash
+    if not rewind(now_fuel) then
+      stay_lost("Restarted and my fuel doesn't match my notes.")
     end
-    if now_fuel == P.fuel - 1 then track_step(P.moving == "b" and -1 or 1) end
-    P.moving = nil
+    if P.recovering then
+      stay_lost("I was restarted while finding my way home and don't know where I am.")
+    end
   end
+  P.moving = nil
   save()
   if P.turn_to and P.sx == 0 and P.sz == 0 then
     -- The only turn ever made on the home spot is the very first one, from
@@ -681,11 +835,7 @@ if saved then
       P.turn_to = nil
       save()
     else
-      report("LOST - move home", "Restarted during my very first turn, so I don't know which way I face.")
-      print("Face me the same way as the miners, then run:  " .. PROGRAM .. " here")
-      print("(Tip: put any block in front of my home spot and this")
-      print("can never happen.)")
-      return
+      stay_lost("Restarted during my very first turn, so I don't know which way I face.")
     end
   elseif P.turn_to then
     -- stopped mid-turn: we face forward or right; try "right" first
@@ -693,10 +843,7 @@ if saved then
     P.turn_to = nil
     report("finding my way home", "Restarted mid-turn: working out which way I'm facing...")
     if not find_facing(candidates) then
-      report("LOST - move home", "Couldn't find my way home after the restart.")
-      print("Put me back on my home spot (above the fuel chest, facing")
-      print("the same way as the miners), then run:  " .. PROGRAM .. " here")
-      return
+      stay_lost("Couldn't find my way home after the restart.")
     end
     report(nil, "Found my way home.")
   elseif P.sx ~= 0 or P.sz ~= 0 then

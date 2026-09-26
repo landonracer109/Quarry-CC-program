@@ -70,6 +70,8 @@ local STATE_FILES = { ".quarry_state_a", ".quarry_state_b" }
 if OPTION == "here" then
   for _, name in ipairs(STATE_FILES) do fs.delete(name) end
   fs.delete(".quarry_away") -- left over from older versions
+  fs.delete(".quarry_log_a")
+  fs.delete(".quarry_log_b")
   print("Forgot the interrupted run. Starting fresh from this spot.")
 end
 
@@ -124,6 +126,84 @@ local LAST_FRONT_SLOT = 11  -- with a trash can, cargo the service turtle takes 
 local S
 local save_seq = 0
 
+-- SERVER CRASHES: a crash puts the world back to its last autosave (up to
+-- ~45 s ago), but our files keep their newer contents, so our notes end up
+-- ahead of where we really are. So every save is also logged, and after a
+-- restart our fuel level (1 per move) tells which logged moment the world
+-- went back to. Two files in turn, JOURNAL_MAX lines each: the older one
+-- always holds the previous JOURNAL_MAX saves (several minutes of work).
+local JOURNAL_FILES = { ".quarry_log_a", ".quarry_log_b" }
+local JOURNAL_MAX = 300
+local POS_FIELDS = { "seq", "y", "z", "pending", "fuel" }
+local journal_file, journal_lines, journal_core
+
+local function journal()
+  if type(S.fuel) ~= "number" then return end
+  if not journal_file or journal_lines >= JOURNAL_MAX then
+    journal_file = (journal_file == JOURNAL_FILES[1]) and JOURNAL_FILES[2] or JOURNAL_FILES[1]
+    local h = fs.open(journal_file, "w")
+    h.close()
+    journal_lines, journal_core = 0, nil -- each file starts with a full copy
+  end
+  -- a full copy when anything but our position changed, else just that
+  local keep = {}
+  for _, k in ipairs(POS_FIELDS) do keep[k] = S[k]; S[k] = nil end
+  local core = textutils.serialize(S)
+  for _, k in ipairs(POS_FIELDS) do S[k] = keep[k] end
+  local line
+  if core ~= journal_core then
+    journal_core = core
+    line = "S " .. textutils.serialize(S):gsub("\n", " ")
+  else
+    line = "P " .. S.seq .. " " .. S.y .. " " .. S.z .. " " .. (S.pending or "-") .. " " .. S.fuel
+  end
+  local h = fs.open(journal_file, "a")
+  h.writeLine(line)
+  h.close()
+  journal_lines = journal_lines + 1
+end
+
+local function clear_journal()
+  for _, name in ipairs(JOURNAL_FILES) do fs.delete(name) end
+  journal_file = nil
+end
+
+-- Every logged state, oldest first.
+local function read_journal()
+  local states = {}
+  for _, name in ipairs(JOURNAL_FILES) do
+    if fs.exists(name) then
+      local h = fs.open(name, "r")
+      local cur
+      while true do
+        local line = h.readLine()
+        if not line then break end
+        local kind, rest = line:sub(1, 1), line:sub(3)
+        if kind == "S" then
+          local ok, t = pcall(textutils.unserialize, rest)
+          if ok and type(t) == "table" and type(t.seq) == "number" then
+            cur = t
+            table.insert(states, t)
+          end
+        elseif kind == "P" and cur then
+          local seq, y, z, pend, fuel = rest:match("^(%-?%d+) (%-?%d+) (%-?%d+) (%S+) (%-?%d+)$")
+          if seq then
+            local t = {}
+            for k, v in pairs(cur) do t[k] = v end
+            t.seq, t.y, t.z, t.fuel = tonumber(seq), tonumber(y), tonumber(z), tonumber(fuel)
+            t.pending = (pend ~= "-") and pend or nil
+            cur = t
+            table.insert(states, t)
+          end
+        end
+      end
+      h.close()
+    end
+  end
+  table.sort(states, function(a, b) return a.seq < b.seq end)
+  return states
+end
+
 local function save()
   save_seq = save_seq + 1
   S.seq = save_seq
@@ -131,6 +211,7 @@ local function save()
   local f = fs.open(STATE_FILES[save_seq % 2 + 1], "w")
   f.write(textutils.serialize(S))
   f.close()
+  journal()
 end
 
 local function load_state()
@@ -150,6 +231,8 @@ local function load_state()
   return best
 end
 
+-- (the log is kept: after a crash we may not really be home yet; it's
+-- cleared when the next run starts)
 local function clear_state()
   for _, name in ipairs(STATE_FILES) do fs.delete(name) end
   S = nil
@@ -363,16 +446,25 @@ end
 -- Burns fuel from our cargo (handed over, or coal we mined), but only as
 -- much as fits in the tank: the rest stays as cargo.
 function burn_fuel()
+  local marked = false
   for i = 1, 16 do
     -- room for any fuel item (a coal block is 800, lava 1000): burning one
     -- into a nearly full tank would waste most of it
     if fuel_limit() - fuel_level() < 1000 then break end
     if is_cargo(i) and turtle.getItemCount(i) > 0 then
+      if not marked then
+        -- a restart in the middle of burning leaves our fuel above our
+        -- notes: this tells it apart from a server crash (see start_run)
+        S.burning = { per = S.per_item }
+        save()
+        marked = true
+      end
       turtle.select(i)
       local before = fuel_level()
       if turtle.refuel(1) then -- fails for anything that isn't fuel
         local per_item = fuel_level() - before
         if per_item > 0 then
+          S.per_item = per_item
           local fit = math.floor((fuel_limit() - fuel_level()) / per_item)
           local n = math.min(fit, turtle.getItemCount(i))
           if n > 0 then turtle.refuel(n) end
@@ -381,6 +473,7 @@ function burn_fuel()
     end
   end
   turtle.select(1)
+  S.burning = nil
   save() -- fuel changed: the saved fuel level must match again
 end
 
@@ -933,7 +1026,7 @@ local function run()
         clear_state()
         say("Finished, back at the start.", "finished")
       else
-        say("Finished, but couldn't get all the way back to my start spot!", "LOST - move to start")
+        lost("Finished, but couldn't get all the way back to my start spot!")
       end
       return
     end
@@ -970,10 +1063,53 @@ local function register_and_wait()
   end
 end
 
+-- Keeps telling the dashboard (the control computer may still be booting
+-- after a restart), until someone sorts us out by hand.
 local function lost(reason)
-  say(reason, "LOST - move to start")
   print("Put me back on my start spot, facing the tunnel, then run:")
   print("  " .. PROGRAM .. " " .. LANE .. " here")
+  while true do
+    say(reason, "LOST - move to start")
+    sleep(30)
+  end
+end
+
+-- After a server crash: find the logged moment the world went back to
+-- (the one whose fuel matches ours now) and carry on from there. Work done
+-- since then is simply done again. Returns true if found.
+local function rewind(now_fuel)
+  local states = read_journal()
+  for i = #states, 1, -1 do
+    local st = states[i]
+    local pick
+    if st.fuel == now_fuel then
+      -- the earliest of the saves made at this fuel level (no move in
+      -- between): anything done after it is safe to do again
+      local j = i
+      while j > 1 and states[j - 1].fuel == now_fuel do j = j - 1 end
+      pick = states[j]
+      for k = j, i do -- a trash can that may be out there: fetch it
+        if states[k].trash_out then pick.trash_out = states[k].trash_out end
+        -- (and which slots were empty before digging it back up)
+        if states[k].trash_free then pick.trash_free = states[k].trash_free end
+      end
+      pick.pending = nil
+    elseif st.pending and st.fuel - 1 == now_fuel then
+      pick = st -- crashed just after this move
+    end
+    if pick then
+      local newest = states[#states].seq
+      S = pick
+      if S.pending then apply_move(S.pending) end
+      S.pending = nil
+      save_seq = newest
+      clear_journal() -- that future never happened: start a fresh log
+      say("Server crash: went back " .. (#states - i) .. " saves to match the world.",
+        "recovered after crash")
+      return true
+    end
+  end
+  return false
 end
 
 -- Starts a run: either resumes the one saved on disk (after a restart) or
@@ -982,7 +1118,21 @@ end
 local function start_run()
   S = load_state()
   if not S then
+    -- Our notes say the run is over. If our fuel doesn't match the log, a
+    -- server crash put us back in the tunnel before we got home: carry on.
+    local now_fuel = turtle.getFuelLevel()
+    local states = read_journal()
+    local last = states[#states]
+    if last and type(now_fuel) == "number" and last.fuel ~= now_fuel and rewind(now_fuel) then
+      save()
+      if S.trash_out then pick_up_trash() end
+      S.collect_ok = nil -- (ask again for the loader go-ahead)
+      say("Restarted: resuming chunk " .. S.chunk .. " (" .. S.phase .. ").", "resuming")
+      return true
+    end
+    S = nil
     local controller, msg = register_and_wait()
+    clear_journal() -- a new run: the old log is no longer needed
     -- samples in 12-14 and a trash can in 15: throw junk away
     local trash = true
     for i = SAMPLE_SLOTS[1], TRASH_SLOT do
@@ -1010,25 +1160,33 @@ local function start_run()
   end
 
   save_seq = S.seq
-  -- Did the last move before the restart happen? Every move costs 1 fuel.
-  if S.pending then
-    local now_fuel = turtle.getFuelLevel()
-    if type(now_fuel) ~= "number" or type(S.fuel) ~= "number" then
+  -- Do our notes match the world? Every move costs exactly 1 fuel.
+  local now_fuel = turtle.getFuelLevel()
+  if type(now_fuel) ~= "number" or type(S.fuel) ~= "number" then
+    if S.pending then
       lost("Restarted mid-move with unlimited fuel, so I can't tell where I am.")
-      return false
-    elseif now_fuel == S.fuel - 1 then
-      apply_move(S.pending)
-    elseif S.fuel == 0 then
-      -- we had no fuel, so that move can't have happened (someone has
-      -- given us fuel by hand since)
-    elseif now_fuel ~= S.fuel then
-      lost("Restarted and my fuel doesn't match my notes, so I can't tell where I am.")
-      return false
     end
-    S.pending = nil
+  elseif S.pending and now_fuel == S.fuel - 1 then
+    apply_move(S.pending) -- the last move happened
+  elseif S.pending and S.fuel == 0 then
+    -- we had no fuel, so that move can't have happened (someone has given
+    -- us fuel by hand since)
+  elseif S.burning and now_fuel > S.fuel
+      and (not S.burning.per or (now_fuel - S.fuel) % S.burning.per == 0) then
+    -- restarted while burning fuel: our position is right
+    S.burning = nil
+  elseif now_fuel ~= S.fuel then
+    -- the world is behind our notes: a server crash
+    if not rewind(now_fuel) then
+      lost("Restarted and my fuel doesn't match my notes, so I can't tell where I am.")
+    end
   end
+  S.pending = nil
   save()
   if S.trash_out then pick_up_trash() end
+  -- the loader go-ahead may be stale (a crash can put the others back in
+  -- the tunnel): ask again
+  S.collect_ok = nil
   say("Restarted: resuming chunk " .. S.chunk .. " (" .. S.phase .. ").", "resuming")
   return true
 end

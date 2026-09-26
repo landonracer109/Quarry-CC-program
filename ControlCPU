@@ -574,6 +574,7 @@ local function do_start()
     }, PROTOCOL)
     miners[lane].status = "starting"
     miners[lane].at_home = nil
+    miners[lane].confirmed = nil
   end
   save_run()
 end
@@ -793,7 +794,9 @@ end
 local function check_all_home()
   if all_home or not next(miners) then return end
   for _, m in pairs(miners) do
-    if not m.home then return end
+    -- m.confirmed: the lane said so since we booted (after a server crash
+    -- our saved notes can be ahead of the world)
+    if not (m.home and m.confirmed) then return end
   end
   all_home = true
   clear_run() -- the run is over: next boot starts fresh
@@ -810,7 +813,7 @@ local function check_all_home()
   done, stopped = {}, {}
   stop_requested, finished, last_chunk, all_home = false, false, false, false
   for _, m in pairs(miners) do
-    m.home, m.at_home, m.pass, m.chunk = nil, nil, nil, nil
+    m.home, m.at_home, m.confirmed, m.pass, m.chunk = nil, nil, nil, nil, nil
     m.status = "finished"
   end
 end
@@ -865,7 +868,7 @@ local function may_collect(lane)
   local waiting = {}
   for other, m in pairs(miners) do
     -- on its start spot (maybe still unloading) is out of the way too
-    if other ~= lane and not (m.home or m.at_home) then
+    if other ~= lane and not ((m.home and m.confirmed) or m.at_home) then
       table.insert(waiting, "lane " .. other)
     end
   end
@@ -899,13 +902,13 @@ local function handle(sender, msg)
     elseif m and m.id == sender and not finished and not stop_requested and not stopped[lane] then
       -- it missed the start message, or was reset with "here": (re)join
       -- the run at the current chunk
-      m.home, m.at_home = nil, nil
+      m.home, m.at_home, m.confirmed = nil, nil, nil
       send(lane, { cmd = "start", id = lane, length = length, depth = depth,
         chunks = last_chunk_no(), chunk = current_chunk, skip = skip })
-    elseif m and m.id == sender and not m.home then
+    elseif m and m.id == sender and not (m.home and m.confirmed) then
       -- A turtle only says hello when it has no run left: this one is on
       -- its start spot. (Its "finished" may have been lost in a restart.)
-      m.home = true
+      m.home, m.confirmed = true, true
       m.status = "finished"
       save_run()
       check_all_home()
@@ -936,7 +939,9 @@ local function handle(sender, msg)
       add_log("control", "Bedrock found: mining " .. depth .. " layers deep.")
       save_run()
     end
-    if stop_requested or finished then
+    -- (after a finished run only a server crash can have a lane still mining:
+    -- the world went back, so let it finish that chunk again)
+    if stop_requested then
       tell_stop(lane)
     else
       m.status = "mining pass " .. tostring(msg.pass)
@@ -957,8 +962,9 @@ local function handle(sender, msg)
     if finished or stop_requested then
       tell_stop(lane)
     elseif msg.chunk < current_chunk then
-      -- it missed the next_chunk message; repeat it
-      send(lane, { cmd = "next_chunk", id = lane, chunk = current_chunk })
+      -- behind: it missed the next_chunk message, or a server crash put
+      -- it back. Send it on to the chunk after the one it just finished.
+      send(lane, { cmd = "next_chunk", id = lane, chunk = msg.chunk + 1 })
     else
       m.status = "chunk " .. msg.chunk .. " done, waiting"
       try_advance()
@@ -984,9 +990,21 @@ local function handle_status(sender, msg)
       m.seen = os.clock()
       if msg.state then m.status = msg.state end
       if msg.state == "home, unloading" then m.at_home = true end
-      if msg.state == "finished" and not m.home then
-        m.home = true
-        save_run()
+      if msg.state == "finished" then
+        m.confirmed = true
+        if not m.home then
+          m.home = true
+          save_run()
+        end
+      end
+      if msg.state == "resuming" or msg.state == "recovered after crash" then
+        -- restarted with a run on: not home (a crash may have put it back
+        -- in the tunnel after it had got home)
+        m.at_home, m.confirmed = nil, nil
+        if m.home then
+          m.home = nil
+          save_run()
+        end
       end
     end
     if msg.text then add_log("lane " .. msg.id, msg.text) end

@@ -3,8 +3,8 @@
 --   disk/join miner <laneId>     for a mining turtle (lane 0..15)
 --   disk/join service            for the service turtle
 --
--- It copies itself onto the turtle as "boot" and makes it run on every
--- boot. From then on the turtle gets its program from the main (control)
+-- It wipes whatever run the turtle was part of (a fresh start), copies
+-- itself onto the turtle as "boot" and makes it run on every boot. From then on the turtle gets its program from the main (control)
 -- computer: at every boot it asks for the latest version, saves it if it
 -- changed, and runs it. If the main computer doesn't answer, it runs the
 -- copy it already has.
@@ -27,6 +27,12 @@ local label = (role == "miner") and ("lane " .. lane) or "service"
 -- Installing (run as "join" from the floppy): copy ourselves as "boot" and
 -- make it run on every boot.
 if fs.getName(me) ~= "boot" then
+  -- joining = a fresh start: forget any run this turtle was part of
+  for _, name in ipairs({ ".quarry_state_a", ".quarry_state_b", ".quarry_log_a",
+      ".quarry_log_b", ".service_state_a", ".service_state_b", ".service_log_a",
+      ".service_log_b", ".quarry_away" }) do
+    fs.delete(name)
+  end
   if fs.exists("boot") then fs.delete("boot") end
   fs.copy(me, "boot")
   local f = fs.open("startup", "w")
