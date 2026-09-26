@@ -38,6 +38,15 @@ if not open_modem() then
   error("No modem attached! Attach a wireless modem and rerun.")
 end
 
+-- Prints a message and sends it (plus an optional short status) to the
+-- control computer's dashboard. Fire-and-forget: broadcasting never waits,
+-- and a lost update only means the display is briefly out of date.
+local STATUS_PROTOCOL = "chunkstatus"
+local function say(text, state)
+  if text then print(text) end
+  rednet.broadcast({ cmd = "status", id = LANE, text = text, state = state }, STATUS_PROTOCOL)
+end
+
 -- IMPORTANT: a turtle throws away rednet messages that arrive while it is
 -- moving, turning or digging. So every exchange below is "keep re-sending
 -- until the other side answers", and we only wait for replies while parked.
@@ -74,7 +83,7 @@ end
 -- non-block is in the way (mob, player, falling sand) we just wait for it
 -- to move.
 local function wait_for_entity(warned)
-  if not warned then print("Something is in my way. Waiting for it to move...") end
+  if not warned then say("Something is in my way. Waiting for it to move...", "blocked") end
   sleep(1)
   return true
 end
@@ -84,9 +93,12 @@ end
 local function dig_move(move, dig, detect)
   local failed_digs, digs, warned = 0, 0, false
   while true do
-    if move() then return true end
+    if move() then
+      if warned then say("Way is clear again.", "working") end
+      return true
+    end
     if turtle.getFuelLevel() == 0 then
-      print("Out of fuel!")
+      say("Out of fuel!", "OUT OF FUEL")
       return false
     end
     if detect() then
@@ -113,12 +125,12 @@ local function safe_move(move, detect)
   local warned = false
   while not move() do
     if turtle.getFuelLevel() == 0 then
-      print("Out of fuel!")
+      say("Out of fuel!", "OUT OF FUEL")
       return false
     end
     if detect() then
       if not warned then
-        print("Something is blocking my way back. Waiting...")
+        say("Something is blocking my way back. Waiting...", "blocked")
         warned = true
       end
       sleep(1)
@@ -126,6 +138,7 @@ local function safe_move(move, detect)
       warned = wait_for_entity(warned)
     end
   end
+  if warned then say("Way is clear again.", "working") end
   return true
 end
 
@@ -257,6 +270,7 @@ local function request_service()
     fuel = turtle.getFuelLevel(),
   }
   print("Waiting for service turtle...")
+  say(nil, "waiting for service")
 
   local acked = false
   local last_sent = -math.huge
@@ -275,6 +289,7 @@ local function request_service()
       if msg.cmd == "ack" then
         acked = true
       elseif msg.cmd == "arrived" then
+        say(nil, "unloading")
         unload_into_service()
         rednet.send(sender, {
           cmd = "unloaded", id = LANE, session = session, seq = req.seq,
@@ -287,6 +302,7 @@ local function request_service()
 
   burn_fuel()
   print("Serviced. Fuel: " .. tostring(turtle.getFuelLevel()))
+  say(nil, "back to work")
   go_to_z(rz)
   go_to_y(ry)
 end
@@ -348,13 +364,13 @@ end
 
 local function place_chunk_loader()
   if turtle.getItemCount(LOADER_SLOT) == 0 then
-    print("WARNING: out of Spot Loaders (slot 15)!")
+    say("WARNING: out of Spot Loaders (slot 15)!")
     return
   end
   turtle.select(LOADER_SLOT)
   if turtle.detectUp() then turtle.digUp() end
   if not turtle.placeUp() then
-    print("WARNING: couldn't place chunk loader.")
+    say("WARNING: couldn't place chunk loader.")
   end
   turtle.select(1)
 end
@@ -369,12 +385,12 @@ end
 -- nobody may drive into a chunk that isn't loaded.
 local function place_next_chunk_loader()
   if turtle.getItemCount(LOADER_SLOT) == 0 then
-    print("Out of Spot Loaders (slot 15)! Ending the run after this chunk.")
+    say("Out of Spot Loaders (slot 15)! Ending the run after this chunk.")
     return false
   end
   go_to_z(z_base + length - 1)
   if not up() then
-    print("Couldn't climb up to place the next loader. Ending the run.")
+    say("Couldn't climb up to place the next loader. Ending the run.")
     return false
   end
   face(0)
@@ -385,9 +401,9 @@ local function place_next_chunk_loader()
   turtle.select(1)
   go_to_y(0)
   if placed then
-    print("Placed loader for chunk " .. (chunk_num + 1))
+    say("Placed loader for chunk " .. (chunk_num + 1))
   else
-    print("Couldn't place the next loader. Ending the run.")
+    say("Couldn't place the next loader. Ending the run.")
   end
   return placed
 end
@@ -482,7 +498,7 @@ while true do
   -- tunnel along the surface to the next chunk; keep trying rather than
   -- carrying on with a wrong position if something blocks the way
   while not go_to_z(z_base) do
-    print("Can't reach the next chunk yet, retrying...")
+    say("Can't reach the next chunk yet, retrying...", "stuck at chunk edge")
     sleep(5)
   end
 end
@@ -492,4 +508,4 @@ ensure_fuel_for(z)
 go_to_y(0)
 go_to_z(0)
 face(0)
-print("Lane " .. LANE .. " finished.")
+say("Finished, back at the start.", "finished")

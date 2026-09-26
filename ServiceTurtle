@@ -40,6 +40,28 @@ local SELF_FUEL_TARGET = 2000
 local HANDSHAKE_TIMEOUT = 60
 local UNBREAKABLE_TRIES = 5
 
+-- Dashboard -----------------------------------------------------------------
+-- Status updates for the control computer's display. Fire-and-forget:
+-- broadcasting never waits, and a lost update only means a stale display.
+local STATUS_PROTOCOL = "chunkstatus"
+local queue = {}   -- FIFO of service jobs (see Requests below)
+local status = { state = "starting up", lane = false }
+local last_report = 0
+
+-- Prints `text` (if given) and sends our current state to the dashboard.
+-- `lane` is the lane we're busy with, or false for none (nil = unchanged).
+local function report(state, text, lane)
+  if state then status.state = state end
+  if lane ~= nil then status.lane = lane end
+  if text then print(text) end
+  rednet.broadcast({
+    cmd = "service", state = status.state, lane = status.lane, text = text,
+    queue = #queue, fuel = turtle.getFuelLevel(),
+    stock = turtle.getItemCount(16),
+  }, STATUS_PROTOCOL)
+  last_report = os.clock()
+end
+
 -- sx = blocks to the right of home (along the row of lanes)
 -- sz = blocks forward from home (into the tunnels)
 local sx, sz, facing = 0, 0, 0 -- facing: 0 = tunnel dir, 1 = right, 2 = back, 3 = left
@@ -82,7 +104,7 @@ local function forward(allow_dig)
   local warned_entity = false
   while not turtle.forward() do
     if turtle.getFuelLevel() == 0 then
-      print("Out of fuel!")
+      report("OUT OF FUEL", "Out of fuel!")
       return false
     end
     if turtle.detect() then
@@ -95,13 +117,13 @@ local function forward(allow_dig)
         end
       else
         waited = waited + 1
-        if waited == 1 then print("Blocked inside a lane, waiting...") end
+        if waited == 1 then report("blocked in a lane", "Blocked inside a lane, waiting...") end
         if waited >= 30 then return false end
         sleep(1)
       end
     else
       if not warned_entity then
-        print("Something is in my way. Waiting for it to move...")
+        report("blocked", "Something is in my way. Waiting for it to move...")
         warned_entity = true
       end
       sleep(1)
@@ -167,8 +189,9 @@ end
 -- Goes home, empties cargo into the output chest, refuels itself and
 -- refills the delivery stock.
 local function restock()
+  report("restocking at home", nil, false)
   while not go_to(0, 0) do
-    print("Can't get home -- something is in the way. Retrying...")
+    report("can't get home", "Can't get home -- something is in the way. Retrying...")
     sleep(5)
   end
 
@@ -181,7 +204,7 @@ local function restock()
       end
     end
     if not cargo_empty() then
-      print("Output chest is full! Empty it...")
+      report("OUTPUT CHEST FULL", "Output chest is full! Empty it...")
       sleep(10)
     end
   end
@@ -192,14 +215,14 @@ local function restock()
   -- whole stack and left nothing for the miners.)
   while fuel_level() < SELF_FUEL_TARGET and turtle.getItemCount(FUEL_SLOT) > FUEL_BATCH do
     if not turtle.refuel(1) then
-      print("Slot 16 isn't fuel! Only put fuel in the fuel chest.")
+      report("BAD FUEL", "Slot 16 isn't fuel! Only put fuel in the fuel chest.")
       break
     end
   end
   top_up_fuel()
 
   while turtle.getItemCount(FUEL_SLOT) == 0 do
-    print("Fuel chest is empty! Add fuel...")
+    report("FUEL CHEST EMPTY", "Fuel chest is empty! Add fuel...")
     sleep(10)
     top_up_fuel()
   end
@@ -209,7 +232,7 @@ local function restock()
 end
 
 -- Requests ------------------------------------------------------------------
-local queue = {}   -- FIFO of jobs
+-- (queue is declared with the dashboard code above)
 local queued = {}  -- [lane] = request key while waiting in the queue
 local served = {}  -- [lane] = key of the last request we completed
 local current_key  -- key of the job in progress
@@ -243,6 +266,7 @@ local function handle_message(sender, msg)
       z = msg.z, fuel = msg.fuel, sender = sender, key = key,
     })
     print("Queued lane " .. msg.id)
+    report()
   end
   reply(sender, "ack", msg)
 end
@@ -255,21 +279,22 @@ local function serve(job)
     restock()
   end
 
-  print("Servicing lane " .. job.id)
+  report("going to lane " .. job.id, "Servicing lane " .. job.id, job.id)
   -- lane N is N+1 blocks right of home; parking at sz = job.z puts us
   -- directly behind a miner waiting at its chunk entrance
   if not go_to(job.id + 1, job.z) then
-    print("Path to lane " .. job.id .. " blocked, will retry.")
+    report("path blocked", "Path to lane " .. job.id .. " blocked, will retry.")
     return false
   end
   face(0)
 
   -- Tell the miner we're here and wait for it to drop its blocks into us.
+  report("unloading lane " .. job.id)
   local start = os.clock()
   local last_sent = -math.huge
   while true do
     if os.clock() - start > HANDSHAKE_TIMEOUT then
-      print("Lane " .. job.id .. " never answered, skipping.")
+      report(nil, "Lane " .. job.id .. " never answered, skipping.")
       return false
     end
     if os.clock() - last_sent >= 3 then
@@ -297,9 +322,9 @@ local function serve(job)
 end
 
 -- Main ----------------------------------------------------------------------
-print("Service turtle starting up...")
+report("starting up", "Service turtle starting up...")
 restock()
-print("Ready. Waiting for requests...")
+report("idle at home", "Ready. Waiting for requests...", false)
 
 while true do
   if #queue > 0 then
@@ -312,8 +337,10 @@ while true do
     if sx ~= 0 or sz ~= 0 then
       restock() -- idle: go home, unload, refill
       print("Ready. Waiting for requests...")
+      report("idle at home", nil, false)
     end
     local sender, msg = rednet.receive(SERVICE_PROTOCOL, 2)
     if msg then handle_message(sender, msg) end
+    if os.clock() - last_report >= 20 then report() end -- heartbeat
   end
 end

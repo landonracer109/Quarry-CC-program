@@ -3,11 +3,22 @@
 -- Registers the mining turtles, starts them, and moves the whole fleet to
 -- the next chunk once every turtle has finished the current one.
 --
+-- DASHBOARD: attach an Advanced Monitor (touching the computer, or through
+-- a wired modem) to see every lane, the service turtle and a live log.
+-- Suggested size: 6 wide x 5 tall; bigger is fine, the text size adapts.
+-- The log is also saved to the file "quarry.log" on this computer.
+--
 -- Start order: service turtle, then all miners, then this.
--- Keys: ENTER = start mining once all turtles are registered
---       S     = stop (turtles finish their current pass and go home)
+-- Controls (keyboard or monitor touch):
+--   ENTER / touch START  = start mining once all turtles are registered
+--   S     / touch STOP   = stop (touch STOP twice to confirm); turtles
+--                          finish their current pass and go home
+--   Q                    = quit once every lane has been told to stop
 
-local PROTOCOL = "chunkquarry" -- control computer <-> miners
+local PROTOCOL = "chunkquarry"        -- control computer <-> miners
+local STATUS_PROTOCOL = "chunkstatus" -- status updates for the dashboard
+local LOG_FILE = "quarry.log"
+local MAX_LOG = 200                   -- log lines kept in memory
 
 local opened = false
 for _, side in ipairs(rs.getSides()) do
@@ -30,16 +41,23 @@ local depth = tonumber(read()) or 60
 io.write("Chunks to mine (0 = until stopped): ")
 local chunks = tonumber(read()) or 0
 
+local PASSES = math.ceil(depth / 3) -- miners clear 3 layers per pass
+
 -- State ---------------------------------------------------------------------
-local miners = {}        -- [lane] = { id=, status=, chunk=, y=, fuel= }
+local miners = {}        -- [lane] = { id=, status=, chunk=, pass=, y=, fuel=, seen= }
 local done = {}          -- [lane] = last chunk that lane finished
 local stopped = {}       -- [lane] = true once we've told it to stop
 local started = false
+local started_at
 local stop_requested = false
 local finished = false   -- no more chunks: answer everything with "stop"
 local last_chunk = false -- lane 0 is out of loaders: end after this chunk
+local all_home = false
 local current_chunk = 1
-local notice = ""
+local service = { state = "not heard from yet" }
+local log_lines = {}
+local program_start = os.clock()
+local confirm_stop_until = 0
 
 local function sorted_lanes()
   local lanes = {}
@@ -48,44 +66,395 @@ local function sorted_lanes()
   return lanes
 end
 
--- The screen is 51x19, so: 1 header line, up to 16 lanes, 2 footer lines.
-local function draw()
-  term.clear()
-  term.setCursorPos(1, 1)
-  local header = string.format("L=%d D=%d chunk %d/%s", length, depth,
-    current_chunk, chunks == 0 and "inf" or tostring(chunks))
-  if stop_requested then header = header .. "  STOPPING" end
-  print(header)
-  for _, lane in ipairs(sorted_lanes()) do
-    local m = miners[lane]
-    print(string.format("%2d c%-3d y%-4s f%-6s %s", lane, m.chunk or 0,
-      tostring(m.y or 0), tostring(m.fuel or "?"), m.status or ""))
+local function fmt_time(s)
+  s = math.floor(s)
+  local h, m, sec = math.floor(s / 3600), math.floor(s / 60) % 60, s % 60
+  if h > 0 then return string.format("%d:%02d:%02d", h, m, sec) end
+  return string.format("%d:%02d", m, sec)
+end
+
+local function ago(t)
+  if not t then return "-" end
+  local s = math.floor(os.clock() - t)
+  if s < 60 then return s .. "s" end
+  if s < 3600 then return math.floor(s / 60) .. "m" end
+  return math.floor(s / 3600) .. "h"
+end
+
+-- Log -----------------------------------------------------------------------
+local WARN_WORDS = {
+  "WARNING", "Out of", "full", "empty", "Can't", "Couldn't", "blocked",
+  "never answered", "isn't fuel", "in my way", "Two turtles",
+}
+
+local function is_warning(text)
+  for _, word in ipairs(WARN_WORDS) do
+    if text:find(word, 1, true) then return true end
   end
-  local _, h = term.getSize()
-  term.setCursorPos(1, h - 1)
-  term.write(notice)
-  term.setCursorPos(1, h)
-  if not started then
-    term.write("ENTER = start (" .. #sorted_lanes() .. " registered)")
-  elseif finished or stop_requested then
-    term.write("Finishing up...")
-  else
-    term.write("S = stop")
+  return false
+end
+
+local function add_log(source, text)
+  local entry = {
+    time = fmt_time(os.clock() - program_start),
+    source = source, text = text, warn = is_warning(text),
+  }
+  table.insert(log_lines, entry)
+  if #log_lines > MAX_LOG then table.remove(log_lines, 1) end
+  local f = fs.open(LOG_FILE, "a")
+  if f then
+    f.writeLine(entry.time .. " [" .. source .. "] " .. text)
+    f.close()
   end
 end
 
+-- Colors --------------------------------------------------------------------
+local function status_color(s)
+  s = s or ""
+  if s:find("OUT OF") or s:find("FULL") or s:find("EMPTY") or s:find("BAD")
+      or s:find("blocked") or s:find("stuck") or s:find("can't") then
+    return colors.red
+  end
+  if s:find("^mining") or s:find("work") then return colors.lime end
+  if s:find("service") or s:find("unloading") then return colors.yellow end
+  if s:find("done") then return colors.cyan end
+  if s:find("^to chunk") or s:find("^going") then return colors.lightBlue end
+  if s:find("restocking") then return colors.orange end
+  if s:find("finished") or s:find("stopped") or s:find("idle")
+      or s:find("not heard") then
+    return colors.lightGray
+  end
+  return colors.white
+end
+
+local function source_color(source)
+  if source == "control" then return colors.cyan end
+  if source == "service" then return colors.orange end
+  return colors.lightBlue
+end
+
+local function run_state()
+  if all_home then return "DONE", colors.lightGray end
+  if finished then return "HEADING HOME", colors.orange end
+  if stop_requested then return "STOPPING", colors.orange end
+  if last_chunk then return "LAST CHUNK", colors.orange end
+  if started then return "RUNNING", colors.lime end
+  return "WAITING FOR START", colors.yellow
+end
+
+-- Drawing helpers -------------------------------------------------------------
+local function set_colors(t, fg, bg)
+  if t.isColor and t.isColor() then
+    t.setTextColor(fg)
+    t.setBackgroundColor(bg)
+  else
+    t.setTextColor(colors.white)
+    t.setBackgroundColor(colors.black)
+  end
+end
+
+local function pad(s, w)
+  s = tostring(s)
+  if #s >= w then return s:sub(1, w) end
+  return s .. string.rep(" ", w - #s)
+end
+
+-- Draws one full row: `left` pieces from the left edge, `right` pieces
+-- against the right edge. A piece is { text, fg, bg }.
+local function row(t, y, left, right, fill)
+  local w = t.getSize()
+  fill = fill or colors.black
+  local right_len = 0
+  for _, p in ipairs(right or {}) do right_len = right_len + #p[1] end
+  local limit = w - right_len
+  t.setCursorPos(1, y)
+  local x = 1
+  for _, p in ipairs(left) do
+    local text = p[1]
+    if x + #text - 1 > limit then text = text:sub(1, math.max(0, limit - x + 1)) end
+    if #text > 0 then
+      set_colors(t, p[2] or colors.white, p[3] or fill)
+      t.write(text)
+      x = x + #text
+    end
+  end
+  if x <= limit then
+    set_colors(t, colors.white, fill)
+    t.write(string.rep(" ", limit - x + 1))
+  end
+  for _, p in ipairs(right or {}) do
+    set_colors(t, p[2] or colors.white, p[3] or fill)
+    t.write(p[1])
+  end
+end
+
+-- Appends a progress bar (two pieces) to `pieces`.
+local function add_bar(t, pieces, frac, width)
+  local n = math.floor(math.max(0, math.min(1, frac)) * width + 0.5)
+  if t.isColor and t.isColor() then
+    table.insert(pieces, { string.rep(" ", n), colors.white, colors.lime })
+    table.insert(pieces, { string.rep(" ", width - n), colors.white, colors.gray })
+  else
+    table.insert(pieces, { string.rep("#", n) .. string.rep("-", width - n) })
+  end
+end
+
+local function lane_progress(lane)
+  local m = miners[lane]
+  if all_home or (done[lane] or 0) >= current_chunk then return 1 end
+  if m.chunk == current_chunk and m.pass then return (m.pass - 1) / PASSES end
+  return 0
+end
+
+local function chunk_progress()
+  local total, n = 0, 0
+  for lane in pairs(miners) do
+    total = total + lane_progress(lane)
+    n = n + 1
+  end
+  if n == 0 then return 0 end
+  return total / n
+end
+
+-- Monitor dashboard -----------------------------------------------------------
+local mon
+local button -- { x1=, x2=, action= } for the touch button in the title bar
+
+local function find_monitor()
+  mon = nil
+  for _, name in ipairs(peripheral.getNames()) do
+    if peripheral.getType(name) == "monitor" then
+      mon = peripheral.wrap(name)
+      break
+    end
+  end
+  if not mon then return end
+  -- use the biggest text that still fits the whole dashboard
+  for _, scale in ipairs({ 1.5, 1, 0.5 }) do
+    mon.setTextScale(scale)
+    local w, h = mon.getSize()
+    if w >= 60 and h >= 32 then break end
+  end
+end
+
+local function do_start()
+  if started then return end
+  if not next(miners) then
+    add_log("control", "Can't start: no turtles registered yet.")
+    return
+  end
+  started = true
+  started_at = os.clock()
+  local lanes = sorted_lanes()
+  add_log("control", string.format("Started %d lanes: length %d, depth %d, %s.",
+    #lanes, length, depth, chunks == 0 and "until stopped" or (chunks .. " chunks")))
+  for _, lane in ipairs(lanes) do
+    rednet.send(miners[lane].id, {
+      cmd = "start", id = lane, length = length, depth = depth, chunks = chunks,
+    }, PROTOCOL)
+    miners[lane].status = "starting"
+  end
+end
+
+local function do_stop()
+  if not started or stop_requested or finished then return end
+  stop_requested = true
+  add_log("control", "Stop requested: lanes finish their current pass and go home.")
+end
+
+local function draw_monitor()
+  local t = mon
+  local w, h = t.getSize()
+  local y = 1
+
+  -- Title bar with the touch button on the right.
+  local state, state_color = run_state()
+  local title = {
+    { " QUARRY ", colors.white, colors.blue },
+    { string.format("  Chunk %d/%s   ", current_chunk, chunks == 0 and "inf" or tostring(chunks)), colors.white },
+    { state, state_color },
+  }
+  local right = { { " " .. (started_at and fmt_time(os.clock() - started_at) or "--:--") .. " ", colors.white } }
+  button = nil
+  local label, bg, action
+  if not started then
+    label, bg, action = " START ", colors.green, do_start
+  elseif not stop_requested and not finished then
+    if os.clock() < confirm_stop_until then
+      label, bg = " CONFIRM STOP? ", colors.orange
+      action = function() confirm_stop_until = 0; do_stop() end
+    else
+      label, bg = " STOP ", colors.red
+      action = function() confirm_stop_until = os.clock() + 5 end
+    end
+  end
+  if label then
+    table.insert(right, { label, colors.white, bg })
+    button = { x1 = w - #label + 1, x2 = w, action = action }
+  end
+  row(t, y, title, right, colors.gray)
+  y = y + 1
+
+  -- Settings and overall progress through the current chunk.
+  local frac = chunk_progress()
+  local prefix = string.format(" Length %d  Depth %d   Chunk ", length, depth)
+  local pieces = { { prefix, colors.lightGray } }
+  add_bar(t, pieces, frac, math.max(10, w - #prefix - 6))
+  table.insert(pieces, { string.format(" %3d%%", math.floor(frac * 100 + 0.5)), colors.white })
+  row(t, y, pieces)
+  y = y + 2
+
+  -- Lane table.
+  local wide = w >= 80
+  local fixed = 6 + 7 + 8 + 6 + 8 + 6 + (wide and 12 or 0)
+  local sw = math.max(10, w - fixed)
+  row(t, y, { { pad(" LANE", 6) .. pad("STATUS", sw) .. pad("CHUNK", 7) .. pad("PASS", 8)
+    .. (wide and pad("PROGRESS", 12) or "") .. pad("Y", 6) .. pad("FUEL", 8) .. pad("SEEN", 6), colors.gray } })
+  y = y + 1
+  local lanes = sorted_lanes()
+  if #lanes == 0 then
+    row(t, y, { { "  No turtles registered yet. Start the miners (m <lane>).", colors.lightGray } })
+    y = y + 1
+  end
+  for _, lane in ipairs(lanes) do
+    if y > h then break end
+    local m = miners[lane]
+    local quiet = m.seen and os.clock() - m.seen > 300 and not all_home
+    pieces = {
+      { pad(" " .. lane, 6), colors.white },
+      { pad(m.status or "", sw), status_color(m.status) },
+      { pad(m.chunk or "-", 7), colors.white },
+      { pad(m.pass and (m.pass .. "/" .. PASSES) or "-", 8), colors.white },
+    }
+    if wide then
+      add_bar(t, pieces, lane_progress(lane), 10)
+      table.insert(pieces, { "  " })
+    end
+    table.insert(pieces, { pad(m.y or "-", 6), colors.white })
+    table.insert(pieces, { pad(m.fuel or "?", 8), colors.white })
+    table.insert(pieces, { pad(ago(m.seen), 6), quiet and colors.red or colors.lightGray })
+    row(t, y, pieces)
+    y = y + 1
+  end
+  if y <= h then row(t, y, {}) y = y + 1 end
+
+  -- Service turtle panel.
+  local quiet = service.seen and os.clock() - service.seen > 120
+  local stock_low = service.stock and service.stock < 16
+  local service_rows = {
+    {
+      { " SERVICE  ", colors.orange },
+      { pad(service.state or "", 24), status_color(service.state) },
+      { pad("lane " .. (service.lane or "-"), 10), colors.white },
+      { "queue " .. (service.queue or 0), colors.white },
+    },
+    {
+      { "          " },
+      { pad("fuel " .. (service.fuel or "?"), 14), colors.white },
+      { pad("coal stock " .. (service.stock or "?"), 17), stock_low and colors.red or colors.white },
+      { "seen " .. ago(service.seen), quiet and colors.red or colors.lightGray },
+    },
+    { { "          last: " .. (service.last_text or "-"), colors.lightGray } },
+  }
+  for _, pieces_row in ipairs(service_rows) do
+    if y <= h then
+      row(t, y, pieces_row)
+      y = y + 1
+    end
+  end
+  if y <= h then row(t, y, {}) y = y + 1 end
+
+  -- Log: newest at the bottom, filling the rest of the screen.
+  if y <= h then
+    row(t, y, { { " LOG ", colors.white, colors.gray }, { "  also saved to " .. LOG_FILE, colors.gray } })
+    y = y + 1
+  end
+  local rows = h - y + 1
+  local first = math.max(1, #log_lines - rows + 1)
+  for i = first, first + rows - 1 do
+    local e = log_lines[i]
+    if e then
+      row(t, y, {
+        { " " .. pad(e.time, 8), colors.gray },
+        { pad(e.source, 9), source_color(e.source) },
+        { e.text, e.warn and colors.red or colors.white },
+      })
+    else
+      row(t, y, {})
+    end
+    y = y + 1
+  end
+end
+
+-- Computer screen (51x19): compact view, same as before plus the latest log.
+local function draw_terminal()
+  local t = term
+  local w, h = t.getSize()
+  local state, state_color = run_state()
+  row(t, 1, {
+    { string.format("L=%d D=%d chunk %d/%s ", length, depth, current_chunk,
+      chunks == 0 and "inf" or tostring(chunks)), colors.white },
+    { state, state_color },
+  })
+  local y = 2
+  for _, lane in ipairs(sorted_lanes()) do
+    if y > h - 2 then break end
+    local m = miners[lane]
+    row(t, y, {
+      { string.format("%2d c%-3s y%-4s f%-6s ", lane, tostring(m.chunk or 0),
+        tostring(m.y or 0), tostring(m.fuel or "?")), colors.white },
+      { m.status or "", status_color(m.status) },
+    })
+    y = y + 1
+  end
+  while y <= h - 2 do row(t, y, {}) y = y + 1 end
+  local last = log_lines[#log_lines]
+  row(t, h - 1, { { last and (last.source .. ": " .. last.text) or "",
+    last and last.warn and colors.red or colors.lightGray } })
+  local help
+  if not started then
+    help = "ENTER = start (" .. #sorted_lanes() .. " registered)"
+  elseif all_home then
+    help = "Done. Q = quit"
+  elseif finished or stop_requested then
+    help = "Finishing up... (Q = quit)"
+  else
+    help = "S = stop"
+  end
+  if mon then help = help .. "   [dashboard on monitor]" end
+  row(t, h, { { help, colors.yellow } })
+end
+
+local last_draw = -math.huge
+local last_draw_error
+local function draw_all(force)
+  if not force and os.clock() - last_draw < 0.5 then return end
+  last_draw = os.clock()
+  draw_terminal()
+  if mon then
+    local ok, err = pcall(draw_monitor)
+    if not ok then
+      -- e.g. the monitor was broken or resized mid-draw
+      if err ~= last_draw_error then
+        last_draw_error = err
+        add_log("control", "Display error: " .. tostring(err))
+      end
+      find_monitor()
+    end
+  end
+end
+
+-- Fleet control ---------------------------------------------------------------
 local function send(lane, msg)
   rednet.send(miners[lane].id, msg, PROTOCOL)
 end
 
-local function start_msg(lane)
-  return { cmd = "start", id = lane, length = length, depth = depth, chunks = chunks }
-end
-
 local function tell_stop(lane)
   send(lane, { cmd = "stop", id = lane })
-  stopped[lane] = true
-  miners[lane].status = "stopped"
+  if not stopped[lane] then
+    stopped[lane] = true
+    miners[lane].status = "stopped, going home"
+  end
 end
 
 local function all_stopped()
@@ -93,6 +462,15 @@ local function all_stopped()
     if not stopped[lane] then return false end
   end
   return true
+end
+
+local function check_all_home()
+  if all_home or not next(miners) then return end
+  for _, m in pairs(miners) do
+    if m.status ~= "finished" then return end
+  end
+  all_home = true
+  add_log("control", "All lanes are home. Stop the service turtle with Ctrl+T.")
 end
 
 -- Called when a lane reports chunk_done: if everyone is done, either move
@@ -103,12 +481,20 @@ local function try_advance()
   end
   if stop_requested or last_chunk or (chunks ~= 0 and current_chunk >= chunks) then
     finished = true
+    if stop_requested then
+      add_log("control", "Stopped after chunk " .. current_chunk .. ". Lanes are heading home.")
+    else
+      add_log("control", "Run complete: " .. current_chunk .. " chunk(s). Lanes are heading home.")
+    end
     for lane in pairs(miners) do tell_stop(lane) end
   else
+    add_log("control", "All lanes finished chunk " .. current_chunk
+      .. ". Moving to chunk " .. (current_chunk + 1) .. ".")
     current_chunk = current_chunk + 1
     for lane in pairs(miners) do
       send(lane, { cmd = "next_chunk", id = lane, chunk = current_chunk })
       miners[lane].status = "to chunk " .. current_chunk
+      miners[lane].pass = nil
     end
   end
 end
@@ -121,23 +507,27 @@ local function handle(sender, msg)
   if msg.cmd == "hello" then
     if not started then
       if m and m.id ~= sender then
-        notice = "Two turtles claim lane " .. lane .. "! Check IDs."
+        add_log("control", "Two turtles claim lane " .. lane .. "! Check their lane numbers.")
       end
+      if not m then add_log("control", "Lane " .. lane .. " registered.") end
       miners[lane] = m or {}
       miners[lane].id = sender
       miners[lane].status = "registered"
+      miners[lane].seen = os.clock()
       send(lane, { cmd = "registered", id = lane })
     elseif m and m.id == sender then
-      send(lane, start_msg(lane)) -- it missed the first start message
+      -- it missed the first start message
+      send(lane, { cmd = "start", id = lane, length = length, depth = depth, chunks = chunks })
     end
     return
   end
 
   -- everything else must come from a registered turtle
   if not m or m.id ~= sender then return end
+  m.seen = os.clock()
 
   if msg.cmd == "progress" then
-    m.chunk, m.y, m.fuel = msg.chunk, msg.y, msg.fuel
+    m.chunk, m.pass, m.y, m.fuel = msg.chunk, msg.pass, msg.y, msg.fuel
     if stop_requested or finished then
       tell_stop(lane)
     else
@@ -149,7 +539,7 @@ local function handle(sender, msg)
       -- lane 0 couldn't load the next chunk, so nobody may drive into it:
       -- let everyone finish this chunk, then end the run
       last_chunk = true
-      notice = "No loader for next chunk - this is the last one."
+      add_log("control", "No loader for the next chunk, so this chunk is the last one.")
     end
     done[lane] = math.max(done[lane] or 0, msg.chunk)
     m.chunk = msg.chunk
@@ -165,44 +555,85 @@ local function handle(sender, msg)
   end
 end
 
--- Main ----------------------------------------------------------------------
-local function network_loop()
-  while true do
-    local sender, msg = rednet.receive(PROTOCOL, 1)
-    if msg then handle(sender, msg) end
-    if started and next(miners) and all_stopped() then return end
-    draw()
+-- Status updates from the miners and the service turtle (dashboard only).
+local function handle_status(sender, msg)
+  if type(msg) ~= "table" then return end
+  if msg.cmd == "service" then
+    service.state, service.lane, service.queue = msg.state, msg.lane or nil, msg.queue
+    service.fuel, service.stock, service.seen = msg.fuel, msg.stock, os.clock()
+    if msg.text then
+      service.last_text = msg.text
+      add_log("service", msg.text)
+    end
+  elseif msg.cmd == "status" and type(msg.id) == "number" then
+    local m = miners[msg.id]
+    if m and m.id == sender then
+      m.seen = os.clock()
+      if msg.state then m.status = msg.state end
+    end
+    if msg.text then add_log("lane " .. msg.id, msg.text) end
+    check_all_home()
   end
 end
 
-local function key_loop()
+-- Main ----------------------------------------------------------------------
+local function network_loop()
   while true do
-    local event, key = os.pullEvent("key")
-    if key == keys.enter and not started then
-      if next(miners) then
-        started = true
-        notice = ""
-        for lane, m in pairs(miners) do
-          send(lane, start_msg(lane))
-          m.status = "starting"
-        end
-      else
-        notice = "No turtles registered yet."
+    local sender, msg, protocol = rednet.receive(nil, 1)
+    if protocol == PROTOCOL then
+      handle(sender, msg)
+    elseif protocol == STATUS_PROTOCOL then
+      handle_status(sender, msg)
+    end
+    draw_all(false)
+    if all_home then return end
+  end
+end
+
+local function ui_loop()
+  while true do
+    local ev = { os.pullEvent() }
+    local e = ev[1]
+    if e == "key" then
+      if ev[2] == keys.enter then
+        do_start()
+      elseif ev[2] == keys.s then
+        do_stop()
+      elseif ev[2] == keys.q and started and all_stopped() then
+        return
       end
-      draw()
-    elseif key == keys.s and started and not stop_requested then
-      stop_requested = true
-      notice = "Stop requested."
-      draw()
+      draw_all(true)
+    elseif e == "monitor_touch" then
+      local x, y = ev[3], ev[4]
+      if button and y == 1 and x >= button.x1 and x <= button.x2 then
+        button.action()
+      end
+      draw_all(true)
+    elseif e == "monitor_resize" or e == "peripheral" or e == "peripheral_detach" then
+      find_monitor()
+      draw_all(true)
     end
   end
 end
 
-draw()
-parallel.waitForAny(network_loop, key_loop)
+find_monitor()
+add_log("control", string.format("Controller ready (length %d, depth %d, %s). Waiting for lanes.",
+  length, depth, chunks == 0 and "until stopped" or (chunks .. " chunks")))
+if not mon then add_log("control", "No monitor found - attach an Advanced Monitor for the dashboard.") end
+term.clear()
+draw_all(true)
+parallel.waitForAny(network_loop, ui_loop)
+draw_all(true)
 
+term.setBackgroundColor(colors.black)
+term.setTextColor(colors.white)
 term.clear()
 term.setCursorPos(1, 1)
-print("All turtles told to stop. They'll return to their")
-print("starting spots. Stop the service turtle (Ctrl+T)")
-print("once they're all home.")
+if all_home then
+  print("All lanes are home. Stop the service turtle")
+  print("with Ctrl+T.")
+else
+  print("Controller closed. Lanes that were told to stop")
+  print("will still drive home by themselves.")
+end
+print("Log saved in " .. LOG_FILE .. " (view it with: edit " .. LOG_FILE .. ")")
