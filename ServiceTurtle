@@ -45,11 +45,30 @@ local function face(dir)
   while facing ~= dir do turnRight() end
 end
 
-local function tryMove(moveFn, digFn, detectFn)
+local HAS_INSPECT = type(turtle.inspect) == "function"
+
+local function isTurtleAhead(inspectFn)
+  if not (HAS_INSPECT and inspectFn) then return false end
+  local ok, data = inspectFn()
+  if ok and data and data.name then
+    return tostring(data.name):find("turtle") ~= nil
+  end
+  return false
+end
+
+local function tryMove(moveFn, digFn, detectFn, inspectFn)
   local attempts = 0
   while not moveFn() do
     attempts = attempts + 1
-    if detectFn() then digFn() else turtle.attack() end
+    if detectFn() then
+      if isTurtleAhead(inspectFn) then
+        print("Blocked by another turtle -- stopping instead of digging through it. Check fleet alignment.")
+        return false
+      end
+      digFn()
+    else
+      turtle.attack()
+    end
     sleep(0.4)
     if attempts > 40 then return false end
   end
@@ -57,7 +76,7 @@ local function tryMove(moveFn, digFn, detectFn)
 end
 
 local function forward()
-  if tryMove(turtle.forward, turtle.dig, turtle.detect) then
+  if tryMove(turtle.forward, turtle.dig, turtle.detect, turtle.inspect) then
     if facing == 0 then sz = sz + 1
     elseif facing == 1 then sx = sx + 1
     elseif facing == 2 then sz = sz - 1
@@ -132,7 +151,7 @@ local function service(laneId, zb)
   goToZ(zb)
   face(0)
 
-  for i = 1, 20 do
+  for i = 1, 14 do -- exactly the 14 ore-only slots -- never reaches slot 15 (loaders) or 16
     if not turtle.suck() then break end
     if inventoryFull() then
       goToZ(0)
