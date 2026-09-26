@@ -22,6 +22,12 @@
 -- done) is saved to disk, and after a restart the controller carries on
 -- where it left off without asking anything. "c new" throws away a saved
 -- run and starts over.
+--
+-- PROGRAM SERVER: turtles set up with "disk/join" get their programs from
+-- this computer at every boot. U (or "c update") downloads the newest
+-- versions from GitHub with the "get" program; they're installed as soon
+-- as no run is in progress, and every turtle is rebooted onto them.
+-- C = change the settings (between runs).
 
 local PROTOCOL = "chunkquarry"        -- control computer <-> miners
 local STATUS_PROTOCOL = "chunkstatus" -- status updates for the dashboard
@@ -50,8 +56,148 @@ if OPTION == "install" then
   return
 end
 
--- The last settings are remembered, so after a reboot you can just press
--- ENTER three times.
+-- Programs for the turtles ---------------------------------------------------
+-- live/ holds the programs the turtles run. An update is downloaded into
+-- staged/ and only moved into live/ between runs, so a turtle that restarts
+-- in the middle of a run always gets the version the run started with.
+local DEPLOY_PROTOCOL = "chunkdeploy"
+local REPO = "https://raw.githubusercontent.com/landonracer109/Quarry-CC-program/"
+local FILES = { { "ControlCPU", "c" }, { "ServiceTurtle", "s" }, { "TurtleTest1", "m" } }
+local ROLE_PROGRAM = { miner = "m", service = "s" }
+
+local function read_file(p)
+  if not fs.exists(p) then return nil end
+  local h = fs.open(p, "r")
+  local text = h.readAll()
+  h.close()
+  return text
+end
+
+-- The same checksum the turtles use to tell whether their copy is current.
+local function checksum(text)
+  local h = 0
+  for i = 1, #text do h = (h * 31 + text:byte(i)) % 2147483647 end
+  return h
+end
+
+-- first time: take the turtle programs from the floppy, if it's in the drive
+for _, name in ipairs({ "m", "s" }) do
+  if not fs.exists("live/" .. name) and fs.exists("disk/" .. name) then
+    if not fs.exists("live") then fs.makeDir("live") end
+    fs.copy("disk/" .. name, "live/" .. name)
+  end
+end
+
+local live_cache = {}
+local function live_program(name)
+  local text = read_file("live/" .. name)
+  if not text then return nil end
+  local c = live_cache[name]
+  if not c or c.text ~= text then
+    c = { text = text, sum = checksum(text) }
+    live_cache[name] = c
+  end
+  return c
+end
+
+local deploy_log = function() end -- becomes the dashboard log once it exists
+local missing_logged = {}
+
+-- Answers turtles asking for their program (runs all the time).
+local function deploy_server()
+  while true do
+    local sender, msg = rednet.receive(DEPLOY_PROTOCOL)
+    if type(msg) == "table" and msg.cmd == "want" and ROLE_PROGRAM[msg.role] then
+      local name = ROLE_PROGRAM[msg.role]
+      local p = live_program(name)
+      local who = msg.role == "miner" and ("lane " .. tostring(msg.lane)) or "the service turtle"
+      if not p then
+        if not missing_logged[name] then
+          missing_logged[name] = true
+          deploy_log("No '" .. name .. "' program to give " .. who .. " yet: press U to download it.")
+        end
+      elseif p.sum == msg.have then
+        rednet.send(sender, { cmd = "current", role = msg.role }, DEPLOY_PROTOCOL)
+      else
+        rednet.send(sender, { cmd = "program", role = msg.role, code = p.text }, DEPLOY_PROTOCOL)
+        deploy_log("Sent the newest program to " .. who .. ".")
+      end
+    end
+  end
+end
+
+local function update_staged()
+  for _, f in ipairs(FILES) do
+    if fs.exists("staged/" .. f[2]) then return true end
+  end
+  return false
+end
+
+-- Downloads all three programs from GitHub into staged/ with the "get"
+-- program. Every download must be a complete Lua program, or nothing is
+-- kept. `ref` is a commit (e.g. "bd6a041"); nil means the newest.
+local function download_update(ref)
+  local get = shell.resolveProgram("get") or (fs.exists("disk/get") and "disk/get") or nil
+  if not get then
+    return false, "No 'get' program on this computer. Copy it from the floppy: copy disk/get get"
+  end
+  local stamp = os.day() .. "-" .. math.floor(os.time() * 1000)
+  local fetched = {}
+  for _, f in ipairs(FILES) do
+    local url = REPO .. (ref or "refs/heads/main") .. "/" .. f[1]
+    if not ref then url = url .. "?nocache=" .. stamp end -- skip GitHub's cache
+    local tmp = f[2] .. ".download"
+    if fs.exists(tmp) then fs.delete(tmp) end
+    pcall(shell.run, get, url, tmp)
+    local text = read_file(tmp)
+    if fs.exists(tmp) then fs.delete(tmp) end
+    if not text or #text < 200 or not loadstring(text) then
+      return false, "Downloading " .. f[1] .. " failed, so nothing was changed."
+    end
+    fetched[f[2]] = text
+  end
+  if not fs.exists("staged") then fs.makeDir("staged") end
+  for name, text in pairs(fetched) do
+    local h = fs.open("staged/" .. name, "w")
+    h.write(text)
+    h.close()
+  end
+  return true
+end
+
+-- Installs a downloaded update. Only called when no run is in progress:
+-- moves staged/ into live/, replaces this program, tells the turtles to
+-- reboot (they fetch the new version as they boot) and reboots this
+-- computer. Turtles that miss the message are caught when they check in.
+local function apply_update()
+  if not fs.exists("live") then fs.makeDir("live") end
+  for _, f in ipairs(FILES) do
+    local name = f[2]
+    local target = (name == "c") and PROGRAM or ("live/" .. name)
+    if fs.exists("staged/" .. name) then
+      if fs.exists(target) then fs.delete(target) end
+      fs.move("staged/" .. name, target)
+    end
+  end
+  for _ = 1, 3 do
+    rednet.broadcast({ cmd = "update_reboot" }, DEPLOY_PROTOCOL)
+    sleep(1)
+  end
+  os.reboot()
+end
+
+if OPTION == "update" then
+  print("Downloading the newest programs from GitHub...")
+  local ok, err = download_update(({ ... })[2])
+  if not ok then
+    print(err)
+    return
+  end
+  print("Downloaded. It installs as soon as no run is in progress.")
+end
+
+-- The last settings are remembered and reused; you're only asked the
+-- first time, after "c new", or after pressing C.
 local SETTINGS_FILE = "quarry.cfg"
 local saved = { 16, 60, 0 }
 if fs.exists(SETTINGS_FILE) then
@@ -94,18 +240,24 @@ end
 if OPTION == "new" then clear_run() end
 local resumed = load_run()
 
+local ASK_FILE = ".ask_settings" -- written by the C key
 local length, depth, chunks
 if resumed then
   length, depth, chunks = resumed.length, resumed.depth, resumed.chunks
   run_seq = resumed.seq
+elseif fs.exists(SETTINGS_FILE) and not fs.exists(ASK_FILE) and OPTION ~= "new" then
+  length, depth, chunks = saved[1], saved[2], saved[3]
 else
-  term.clear()
-  term.setCursorPos(1, 1)
-  print("=== Chunk Quarry Control ===")
-  print("(press ENTER to keep the value in brackets)")
-  length = ask("Chunk length (blocks per lane)", saved[1])
-  depth = ask("Depth (layers to mine down)", saved[2])
-  chunks = ask("Chunks to mine (0 = until stopped)", saved[3])
+  if fs.exists(ASK_FILE) then fs.delete(ASK_FILE) end
+  parallel.waitForAny(function()
+    term.clear()
+    term.setCursorPos(1, 1)
+    print("=== Chunk Quarry Control ===")
+    print("(press ENTER to keep the value in brackets)")
+    length = ask("Chunk length (blocks per lane)", saved[1])
+    depth = ask("Depth (layers to mine down)", saved[2])
+    chunks = ask("Chunks to mine (0 = until stopped)", saved[3])
+  end, deploy_server) -- keep handing out programs while you type
 
   local f = fs.open(SETTINGS_FILE, "w")
   f.write(length .. "\n" .. depth .. "\n" .. chunks .. "\n")
@@ -519,9 +671,9 @@ local function draw_terminal()
     last and last.warn and colors.red or colors.lightGray } })
   local help
   if not started then
-    help = "ENTER = start (" .. #sorted_lanes() .. " registered)"
+    help = "ENTER start U update C settings (" .. #sorted_lanes() .. " ready)"
   elseif all_home then
-    help = "Done. Q = quit"
+    help = "Done."
   elseif finished or stop_requested then
     help = "Finishing up... (Q = quit)"
   else
@@ -578,7 +730,36 @@ local function check_all_home()
   end
   all_home = true
   clear_run() -- the run is over: next boot starts fresh
+  if update_staged() then
+    add_log("control", "All lanes are home. Installing the downloaded update...")
+    draw_all(true)
+    apply_update()
+  end
   add_log("control", "All lanes are home. The next run starts with ENTER or START.")
+  -- ready for the next run with the same settings
+  started, started_at = false, nil
+  current_chunk = 1
+  done, stopped = {}, {}
+  stop_requested, finished, last_chunk, all_home = false, false, false, false
+  for _, m in pairs(miners) do
+    m.home, m.pass, m.chunk = nil, nil, nil
+    m.status = "finished"
+  end
+end
+
+-- Between runs, a turtle started by the boot loader that reports an old
+-- program version is told to reboot (it fetches the new one as it boots).
+local nudges = {} -- [computer id] = { count=, at= }
+local function nudge_if_outdated(sender, role, version, who)
+  if started or not version then return end
+  local p = live_program(ROLE_PROGRAM[role])
+  if not p or p.sum == version then return end
+  local n = nudges[sender] or { count = 0, at = -math.huge }
+  if n.count >= 3 or os.clock() - n.at < 30 then return end
+  n.count, n.at = n.count + 1, os.clock()
+  nudges[sender] = n
+  rednet.send(sender, { cmd = "update_reboot" }, DEPLOY_PROTOCOL)
+  add_log("control", "Telling " .. who .. " to reboot into the newest version.")
 end
 
 -- Called when a lane reports chunk_done: if everyone is done, either move
@@ -614,6 +795,7 @@ local function handle(sender, msg)
   local m = miners[lane]
 
   if msg.cmd == "hello" then
+    nudge_if_outdated(sender, "miner", msg.version, "lane " .. lane)
     if not started then
       if m and m.id ~= sender then
         add_log("control", "Two turtles claim lane " .. lane .. "! Check their lane numbers.")
@@ -626,7 +808,7 @@ local function handle(sender, msg)
       miners[lane].seen = os.clock()
       send(lane, { cmd = "registered", id = lane })
       if changed then save_run() end
-    elseif m and m.id == sender and not finished then
+    elseif m and m.id == sender and not finished and not stop_requested and not stopped[lane] then
       -- it missed the start message, or was reset with "here": (re)join
       -- the run at the current chunk
       m.home = nil
@@ -678,6 +860,7 @@ local function handle_status(sender, msg)
   if msg.cmd == "service" then
     service.state, service.lane, service.queue = msg.state, msg.lane or nil, msg.queue
     service.fuel, service.stock, service.seen = msg.fuel, msg.stock, os.clock()
+    nudge_if_outdated(sender, "service", msg.version, "the service turtle")
     if msg.text then
       service.last_text = msg.text
       add_log("service", msg.text)
@@ -707,7 +890,6 @@ local function network_loop()
       handle_status(sender, msg)
     end
     draw_all(false)
-    if all_home then return end
   end
 end
 
@@ -720,8 +902,27 @@ local function ui_loop()
         do_start()
       elseif ev[2] == keys.s then
         do_stop()
-      elseif ev[2] == keys.q and started and all_stopped() then
+      elseif ev[2] == keys.q and (not started or all_stopped()) then
         return
+      elseif ev[2] == keys.u then
+        add_log("control", "Downloading the newest programs from GitHub...")
+        draw_all(true)
+        local ok, err = download_update()
+        term.clear()
+        if not ok then
+          add_log("control", err)
+        elseif started then
+          add_log("control", "Update downloaded: it installs when this run is over.")
+        else
+          add_log("control", "Update downloaded: installing and restarting everything...")
+          draw_all(true)
+          apply_update()
+        end
+      elseif ev[2] == keys.c and not started then
+        local h = fs.open(ASK_FILE, "w")
+        h.write("ask for the settings on the next boot\n")
+        h.close()
+        os.reboot()
       end
       draw_all(true)
     elseif e == "monitor_touch" then
@@ -738,6 +939,12 @@ local function ui_loop()
 end
 
 find_monitor()
+deploy_log = function(text) add_log("control", text) end
+if update_staged() and not (resumed and started) then
+  add_log("control", "Installing the downloaded update...")
+  draw_all(true)
+  apply_update()
+end
 if resumed and started then
   add_log("control", "Restarted: resuming the run at chunk " .. current_chunk .. ".")
   check_all_home()
@@ -750,18 +957,17 @@ end
 if not mon then add_log("control", "No monitor found - attach an Advanced Monitor for the dashboard.") end
 term.clear()
 draw_all(true)
-parallel.waitForAny(network_loop, ui_loop)
+parallel.waitForAny(network_loop, ui_loop, deploy_server)
 draw_all(true)
 
 term.setBackgroundColor(colors.black)
 term.setTextColor(colors.white)
 term.clear()
 term.setCursorPos(1, 1)
-if all_home then
-  print("All lanes are home. Stop the service turtle")
-  print("with Ctrl+T.")
+if started and not all_stopped() then
+  print("Controller closed in the middle of a run. Run it")
+  print("again to carry on (the run is saved).")
 else
-  print("Controller closed. Lanes that were told to stop")
-  print("will still drive home by themselves.")
+  print("Controller closed. Run it again for the next run.")
 end
 print("Log saved in " .. LOG_FILE .. " (view it with: edit " .. LOG_FILE .. ")")
