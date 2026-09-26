@@ -268,14 +268,33 @@ local ASK_FILE = ".ask_settings" -- written by the C key
 local length, depth, chunks
 -- chunks mined in earlier runs, skipped by this one
 local skip = read_progress()
+local ask_now = fs.exists(ASK_FILE) or OPTION == "new" or not fs.exists(SETTINGS_FILE)
 if resumed then
+  -- (the turtles registered before the reboot are kept either way)
   length, depth, chunks = resumed.length or CHUNK_SIZE, resumed.depth, resumed.chunks
   skip = resumed.skip or 0
   run_seq = resumed.seq
-elseif fs.exists(SETTINGS_FILE) and not fs.exists(ASK_FILE) and OPTION ~= "new" then
-  length, chunks = CHUNK_SIZE, saved[3]
+end
+if resumed and resumed.started then
+  -- a run is in progress: carry on without asking anything
+  if fs.exists(ASK_FILE) then fs.delete(ASK_FILE) end
+elseif not ask_now then
+  if not resumed then length, chunks = CHUNK_SIZE, saved[3] end
 else
   if fs.exists(ASK_FILE) then fs.delete(ASK_FILE) end
+  -- the questions are on the computer's own screen: say so on the monitor
+  for _, name in ipairs(peripheral.getNames()) do
+    if peripheral.getType(name) == "monitor" then
+      local m = peripheral.wrap(name)
+      m.setBackgroundColor(colors.black)
+      m.clear()
+      m.setTextScale(1)
+      m.setCursorPos(2, 2)
+      m.write("Answer the questions on the")
+      m.setCursorPos(2, 3)
+      m.write("main computer's screen.")
+    end
+  end
   parallel.waitForAny(function()
     term.clear()
     term.setCursorPos(1, 1)
@@ -286,6 +305,7 @@ else
     write_progress(math.max(0, math.floor(mined)))
   end, deploy_server) -- keep handing out programs while you type
   length = CHUNK_SIZE
+  skip = read_progress()
 
   local f = fs.open(SETTINGS_FILE, "w")
   f.write(length .. "\n0\n" .. chunks .. "\n")
@@ -347,6 +367,8 @@ if resumed then
       status = l.home and "finished" or (started and "restarted, waiting" or "registered"),
     }
   end
+  -- new answers to the questions: save them with the kept lanes
+  if not started and ask_now then save_run() end
 end
 
 local function sorted_lanes()
@@ -818,7 +840,7 @@ local function try_advance()
     if stop_requested then
       add_log("control", "Stopped after chunk " .. current_chunk .. ". Lanes are heading home.")
     else
-      add_log("control", "Run complete: " .. current_chunk .. " chunk(s). Lanes are heading home.")
+      add_log("control", "Run complete: mined up to chunk " .. current_chunk .. ". Lanes are heading home.")
     end
     for lane in pairs(miners) do tell_stop(lane) end
   else
