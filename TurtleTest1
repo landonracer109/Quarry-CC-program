@@ -22,7 +22,9 @@
 --     Lane 0 is the LEFTMOST; lane numbers increase to the RIGHT
 --     (standing behind the turtles, looking the way they face).
 --   * Wireless modem on every turtle.
---   * Lane 0 only: Spot Loaders in slot 16, one per chunk.
+--   * Lane 0 only: Spot Loaders in slot 16, one per chunk. It picks them
+--     back up at the end of every run (finished or stopped), except chunk
+--     1's loader above its start spot, which keeps the home area loaded.
 --   * Run "m <lane> install" once, then reboot it (hold Ctrl+R).
 
 local args = { ... }
@@ -411,8 +413,18 @@ local function loaders_left()
   return S.loaders > 0
 end
 
--- Chunk 1's loader goes right above the start spot.
+-- Chunk 1's loader goes right above the start spot, and stays there
+-- between runs: if it's already in place, keep it.
 local function place_first_loader()
+  if turtle.getItemCount(LOADER_SLOT) > 0 then
+    turtle.select(LOADER_SLOT)
+    local already = turtle.compareUp()
+    turtle.select(1)
+    if already then
+      S.loader_top = math.max(S.loader_top or 0, 1)
+      return
+    end
+  end
   if not loaders_left() then
     say("WARNING: no Spot Loaders in slot 16!")
     return
@@ -421,6 +433,7 @@ local function place_first_loader()
   turtle.select(LOADER_SLOT)
   if turtle.placeUp() then
     S.loaders = S.loaders - 1
+    S.loader_top = math.max(S.loader_top or 0, 1)
   else
     say("WARNING: couldn't place chunk loader.")
   end
@@ -450,7 +463,10 @@ local function place_next_chunk_loader()
   turtle.select(LOADER_SLOT)
   local placed = turtle.place()
   turtle.select(1)
-  if placed then S.loaders = S.loaders - 1 end
+  if placed then
+    S.loaders = S.loaders - 1
+    S.loader_top = S.chunk + 1 -- highest chunk with a loader in it
+  end
   save()
   go_to_y(0)
   if placed then
@@ -459,6 +475,66 @@ local function place_next_chunk_loader()
     say("Couldn't place the next loader. Ending the run.")
   end
   return placed
+end
+
+-- At the end of a run lane 0 is the last one out and takes the loaders back
+-- (into slot 16) on its way home. First the control computer must confirm
+-- that every other lane and the service turtle are back: a chunk whose
+-- loader we take is unloaded, and a turtle still in it would be frozen.
+local function wait_to_collect()
+  say("Waiting for everyone else to get home, then picking up the loaders.",
+    "waiting to collect loaders")
+  local last_sent = -math.huge
+  while true do
+    if os.clock() - last_sent >= 5 then
+      rednet.send(S.controller, { cmd = "may_collect", id = LANE }, PROTOCOL)
+      last_sent = os.clock()
+    end
+    local sender, msg = rednet.receive(PROTOCOL, 1)
+    if sender == S.controller and type(msg) == "table"
+        and msg.cmd == "collect" and msg.id == LANE then
+      return
+    end
+  end
+end
+
+-- Backs out of the tunnel picking up each chunk's loader from the chunk
+-- before it (still loaded by its own loader): at the far end of that chunk,
+-- one up, dig forward -- the spot it was placed from. Safe to restart: a
+-- spot that's already empty is just skipped. Chunk 1's loader (above our
+-- start spot) stays, so the home chunk stays loaded between runs.
+local function collect_loaders()
+  if not S.collect_ok then
+    wait_to_collect()
+    S.collect_ok = true
+    save()
+    say("Picking up the chunk loaders.", "collecting loaders")
+  end
+  -- make room in slot 16 if blocks ended up there after the loaders ran out
+  if turtle.getItemCount(LOADER_SLOT) > 0 and S.loaders == 0 then
+    for i = 1, 15 do
+      if turtle.getItemCount(i) == 0 then
+        turtle.select(LOADER_SLOT)
+        turtle.transferTo(i)
+        break
+      end
+    end
+  end
+  while (S.loader_top or 0) >= 2 do
+    local j = S.loader_top
+    go_to_y(0)
+    go_to_z(S.length * (j - 1) - 1)
+    go_to_y(1)
+    if turtle.detect() then
+      turtle.select(LOADER_SLOT)
+      turtle.dig()
+    end
+    turtle.select(1)
+    S.loaders = turtle.getItemCount(LOADER_SLOT)
+    S.loader_top = j - 1
+    save()
+  end
+  go_to_y(0)
 end
 
 -- Mining --------------------------------------------------------------------
@@ -578,7 +654,15 @@ local function run()
       save()
 
     elseif S.phase == "going_home" then
-      ensure_fuel_for(S.z)
+      local collecting = LANE == 0 and (S.loader_top or 0) >= 2
+      if collecting then
+        -- may drive to the far end of this chunk, plus up/down per loader
+        ensure_fuel_for(S.z + S.length + 2 * S.loader_top + 2)
+        go_to_y(0)
+        collect_loaders()
+      else
+        ensure_fuel_for(S.z)
+      end
       go_to_y(0)
       go_to_z(0)
       if S.y == 0 and S.z == 0 then
@@ -651,6 +735,7 @@ local function start_run()
       loaders = (LANE == 0) and turtle.getItemCount(LOADER_SLOT) or 0,
       -- joining a run already past chunk 1: that chunk's loader is placed
       first_loader_done = chunk > 1,
+      loader_top = (chunk > 1) and chunk or nil,
     }
     S.phase = (S.z_base > 0) and "transit" or "mining"
     save_seq = 0

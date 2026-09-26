@@ -16,8 +16,10 @@
 --   Q                    = quit once every lane has been told to stop
 --
 -- "c install" makes this computer run the controller on every boot. The
--- last length/chunks are remembered: just press ENTER to reuse them. The
--- miners always dig down to bedrock and report how deep that is.
+-- number of chunks is remembered: just press ENTER to reuse it. Chunks are
+-- 16 blocks long, and the miners always dig down to bedrock and report how
+-- deep that is. At the end of every run lane 0 picks the loaders back up,
+-- once this computer has seen everyone else get home.
 --
 -- SURVIVES SERVER RESTARTS: the run (settings, lanes, current chunk, who is
 -- done) is saved to disk, and after a restart the controller carries on
@@ -200,7 +202,8 @@ end
 -- The last settings are remembered and reused; you're only asked the
 -- first time, after "c new", or after pressing C.
 local SETTINGS_FILE = "quarry.cfg"
--- quarry.cfg: length, (unused: depth, from older versions), chunks
+local CHUNK_SIZE = 16 -- blocks per lane per chunk (a Minecraft chunk)
+-- quarry.cfg: (unused: length and depth, from older versions), chunks
 local saved = { 16, 0, 0 }
 if fs.exists(SETTINGS_FILE) then
   local f = fs.open(SETTINGS_FILE, "r")
@@ -245,10 +248,10 @@ local resumed = load_run()
 local ASK_FILE = ".ask_settings" -- written by the C key
 local length, depth, chunks
 if resumed then
-  length, depth, chunks = resumed.length, resumed.depth, resumed.chunks
+  length, depth, chunks = resumed.length or CHUNK_SIZE, resumed.depth, resumed.chunks
   run_seq = resumed.seq
 elseif fs.exists(SETTINGS_FILE) and not fs.exists(ASK_FILE) and OPTION ~= "new" then
-  length, chunks = saved[1], saved[3]
+  length, chunks = CHUNK_SIZE, saved[3]
 else
   if fs.exists(ASK_FILE) then fs.delete(ASK_FILE) end
   parallel.waitForAny(function()
@@ -256,9 +259,9 @@ else
     term.setCursorPos(1, 1)
     print("=== Chunk Quarry Control ===")
     print("(press ENTER to keep the value in brackets)")
-    length = ask("Chunk length (blocks per lane)", saved[1])
     chunks = ask("Chunks to mine (0 = until stopped)", saved[3])
   end, deploy_server) -- keep handing out programs while you type
+  length = CHUNK_SIZE
 
   local f = fs.open(SETTINGS_FILE, "w")
   f.write(length .. "\n0\n" .. chunks .. "\n")
@@ -795,6 +798,20 @@ local function try_advance()
   save_run()
 end
 
+-- Lane 0 may take the loaders back once every other lane is home and the
+-- service turtle is back on its home row with nothing to do.
+local function may_collect(lane)
+  local waiting = {}
+  for other, m in pairs(miners) do
+    if other ~= lane and not m.home then table.insert(waiting, "lane " .. other) end
+  end
+  table.sort(waiting)
+  if not (service.on_row and (service.queue or 0) == 0) then
+    table.insert(waiting, "the service turtle")
+  end
+  return #waiting == 0, waiting
+end
+
 local function handle(sender, msg)
   if type(msg) ~= "table" or type(msg.id) ~= "number" then return end
   local lane = msg.id
@@ -820,6 +837,13 @@ local function handle(sender, msg)
       m.home = nil
       send(lane, { cmd = "start", id = lane, length = length, depth = depth,
         chunks = chunks, chunk = current_chunk })
+    elseif m and m.id == sender and not m.home then
+      -- A turtle only says hello when it has no run left: this one is on
+      -- its start spot. (Its "finished" may have been lost in a restart.)
+      m.home = true
+      m.status = "finished"
+      save_run()
+      check_all_home()
     end
     return
   end
@@ -828,7 +852,18 @@ local function handle(sender, msg)
   if not m or m.id ~= sender then return end
   m.seen = os.clock()
 
-  if msg.cmd == "progress" then
+  if msg.cmd == "may_collect" then
+    local ok, waiting = may_collect(lane)
+    if ok then
+      if m.status ~= "collecting loaders" then
+        add_log("control", "Everyone else is home: lane " .. lane .. " is picking up the loaders.")
+      end
+      m.status = "collecting loaders"
+      send(lane, { cmd = "collect", id = lane })
+    else
+      m.status = "waiting for " .. waiting[1]
+    end
+  elseif msg.cmd == "progress" then
     m.chunk, m.pass, m.y, m.fuel = msg.chunk, msg.pass, msg.y, msg.fuel
     if type(msg.depth) == "number" and msg.depth ~= depth then
       depth = msg.depth
@@ -871,6 +906,7 @@ local function handle_status(sender, msg)
   if msg.cmd == "service" then
     service.state, service.lane, service.queue = msg.state, msg.lane or nil, msg.queue
     service.fuel, service.stock, service.seen = msg.fuel, msg.stock, os.clock()
+    service.on_row = msg.on_row
     nudge_if_outdated(sender, "service", msg.version, "the service turtle")
     if msg.text then
       service.last_text = msg.text

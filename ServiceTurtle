@@ -111,6 +111,7 @@ end
 -- Status updates for the control computer's display. Fire-and-forget:
 -- broadcasting never waits, and a lost update only means a stale display.
 local queue = {}   -- FIFO of service jobs (see Requests below)
+local P            -- our position (see Position below)
 local status = { state = "starting up", lane = false }
 local last_report = 0
 
@@ -124,6 +125,9 @@ local function report(state, text, lane)
     cmd = "service", state = status.state, lane = status.lane, text = text,
     queue = #queue, fuel = turtle.getFuelLevel(),
     stock = fuel_stock(), version = MY_VERSION,
+    -- on the home row, out of every lane: lane 0 may take the loaders back
+    on_row = P ~= nil and P.sz == 0 and not P.moving and not P.turn_to
+      and not P.recovering,
   }, STATUS_PROTOCOL)
   last_report = os.clock()
 end
@@ -136,7 +140,7 @@ end
 -- P.turn_to  = a turn to this facing was about to happen
 -- P.recovering = we were finding our facing after a restart
 -- Saved to two files in turn, so a restart mid-write never loses both.
-local P = { sx = 0, sz = 0, facing = 0 }
+P = { sx = 0, sz = 0, facing = 0 }
 local save_seq = 0
 
 local function save()
@@ -620,6 +624,7 @@ while true do
     if P.sz ~= 0 then
       report("waiting on the home row", nil, false)
       go_to_z(0)
+      report()
     end
     -- After a while with nothing to do, go home to empty out and refill.
     idle_since = idle_since or os.clock()
