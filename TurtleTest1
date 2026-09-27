@@ -55,7 +55,7 @@ end
 
 -- Shown on the dashboard, so you can tell whether everything got updated.
 -- c, m and s carry the same number; it goes up with every change.
-local VERSION = "v4"
+local VERSION = "v5"
 
 -- Our program's checksum, so the main computer can spot a turtle running an
 -- old version between runs. Only when we were started by the boot loader
@@ -481,9 +481,10 @@ end
 -- Turtles never attack: CC 1.63 can't tell a mob from a player, so when a
 -- non-block is in the way (mob, player, falling sand) we just wait for it
 -- to move.
-local function wait_for_entity(warned)
+local function wait_for_entity(warned, waits)
   if not warned then say("Something is in my way. Waiting for it to move...", "blocked") end
-  sleep(1)
+  -- longer and longer (every try writes our notes to disk), up to 10 s
+  sleep(math.min(1 + (waits or 0), 10))
   return true
 end
 
@@ -512,7 +513,7 @@ local function wait_for_fuel()
 end
 
 local function dig_move(dir, move, dig, detect)
-  local failed_digs, digs, warned = 0, 0, false
+  local failed_digs, digs, warned, waits = 0, 0, false, 0
   while true do
     if try_move(dir, move) then
       if warned then say("Way is clear again.", "working") end
@@ -537,7 +538,8 @@ local function dig_move(dir, move, dig, detect)
         end
       end
     else
-      warned = wait_for_entity(warned)
+      warned = wait_for_entity(warned, waits)
+      waits = waits + 1
     end
     sleep(0.3)
   end
@@ -661,9 +663,11 @@ function burn_fuel()
     if is_cargo(i) and turtle.getItemCount(i) > 0 then
       -- A restart in the middle of burning leaves our fuel above our
       -- notes: this tells it apart from a server crash (see start_run).
-      -- Each slot may hold a different fuel (coal 80, a coal block 800),
-      -- so the first item is "any amount", the rest whole items of it.
-      S.burning = { per = nil }
+      -- We note how many items the slot held: the inventory goes back with
+      -- the world, so fewer items means we really burned them. Each slot
+      -- may hold a different fuel (coal 80, a coal block 800): the first
+      -- item is "any amount", the rest whole items of it.
+      S.burning = { slot = i, count = turtle.getItemCount(i) }
       save()
       marked = true
       turtle.select(i)
@@ -672,7 +676,7 @@ function burn_fuel()
         local per_item = fuel_level() - before
         if per_item > 0 then
           S.per_item = per_item
-          S.burning = { per = per_item }
+          S.burning = { slot = i, count = turtle.getItemCount(i), per = per_item }
           save()
           local fit = math.floor((fuel_limit() - fuel_level()) / per_item)
           local n = math.min(fit, turtle.getItemCount(i))
@@ -1411,6 +1415,19 @@ local function rewind(now_fuel, now_wt)
   return false
 end
 
+-- Restarted while burning, with more fuel than our notes: did the burn
+-- really happen (items gone from the slot, and the right amount of fuel
+-- for them)? If not, a server crash undid some moves.
+local function burn_explains(now_fuel)
+  local b = S.burning
+  if not b.slot then -- (notes from an older version)
+    return not b.per or (now_fuel - S.fuel) % b.per == 0
+  end
+  local used = (b.count or 0) - turtle.getItemCount(b.slot)
+  if b.per then return used >= 1 and now_fuel - S.fuel == used * b.per end
+  return used == 1
+end
+
 -- Starts a run: either resumes the one saved on disk (after a restart) or
 -- waits for the control computer to start a new one. Returns false if we
 -- can't carry on (LOST).
@@ -1484,8 +1501,7 @@ local function start_run()
   elseif S.pending and S.fuel == 0 then
     -- we had no fuel, so that move can't have happened (someone has given
     -- us fuel by hand since)
-  elseif S.burning and now_fuel > S.fuel
-      and (not S.burning.per or (now_fuel - S.fuel) % S.burning.per == 0) then
+  elseif S.burning and now_fuel > S.fuel and burn_explains(now_fuel) then
     -- restarted while burning fuel: our position is right
     S.burning = nil
   elseif now_fuel ~= S.fuel then

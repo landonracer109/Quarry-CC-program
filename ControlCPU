@@ -70,7 +70,7 @@ end
 local DEPLOY_PROTOCOL = "chunkdeploy"
 -- Shown on the dashboard, so you can tell whether everything got updated.
 -- c, m and s carry the same number; it goes up with every change.
-local VERSION = "v4"
+local VERSION = "v5"
 
 local REPO = "https://raw.githubusercontent.com/landonracer109/Quarry-CC-program/"
 local FILES = { { "ControlCPU", "c" }, { "ServiceTurtle", "s" }, { "TurtleTest1", "m" } }
@@ -747,7 +747,9 @@ local function draw_monitor()
   if y <= h then row(t, y, {}) y = y + 1 end
 
   -- Service turtle panel.
+  -- (idle at home it says nothing, on purpose: only silence while busy is odd)
   local quiet = started and service.seen and os.clock() - service.seen > 300
+    and service.state ~= "idle at home"
   local stock_low = service.stock and service.stock < 16
   local service_rows = {
     {
@@ -948,8 +950,9 @@ local function try_advance()
     add_log("control", "All lanes finished chunk " .. current_chunk
       .. ". Moving to chunk " .. (current_chunk + 1) .. ".")
     current_chunk = current_chunk + 1
+    -- one message every lane hears at once (they all set off together)
+    queue_send(nil, { cmd = "next_chunk", chunk = current_chunk }, PROTOCOL)
     for lane in pairs(miners) do
-      send(lane, { cmd = "next_chunk", id = lane, chunk = current_chunk })
       miners[lane].status = "to chunk " .. current_chunk
       miners[lane].pass = nil
     end

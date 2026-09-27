@@ -52,7 +52,7 @@ end
 
 -- Shown on the dashboard, so you can tell whether everything got updated.
 -- c, m and s carry the same number; it goes up with every change.
-local VERSION = "v4"
+local VERSION = "v5"
 
 -- Our program's checksum, so the main computer can spot a turtle running an
 -- old version between runs. Only when we were started by the boot loader
@@ -664,8 +664,10 @@ local fuel_measured = false -- fuel per item measured since this boot
 -- tells it apart from a server crash (see the startup code).
 -- Until this boot's first burn we don't know what the fuel is (the chest
 -- may have gone from coal to coal blocks): then any amount is fine.
+-- The stock is noted too: the inventory goes back with the world in a
+-- crash, so fewer items means we really burned them.
 local function start_burn()
-  P.burning = { per = fuel_measured and P.per_item or nil }
+  P.burning = { per = fuel_measured and P.per_item or nil, stock = fuel_stock() }
   save()
 end
 local function burn_one_fuel()
@@ -1047,8 +1049,15 @@ if saved then
     if P.moving then stay_lost("Restarted mid-move with unlimited fuel.") end
   elseif P.moving and now_fuel == P.fuel - 1 then
     track_step(P.moving == "b" and -1 or 1) -- the last step happened
-  elseif P.burning and now_fuel > P.fuel
-      and (not P.burning.per or (now_fuel - P.fuel) % P.burning.per == 0) then
+  elseif P.burning and now_fuel > P.fuel and (function()
+      local b = P.burning
+      if not b.stock then -- (notes from an older version)
+        return not b.per or (now_fuel - P.fuel) % b.per == 0
+      end
+      local used = b.stock - fuel_stock()
+      if b.per then return used >= 1 and now_fuel - P.fuel == used * b.per end
+      return used == 1
+    end)() then
     -- restarted while burning fuel: our position is right
     P.burning = nil
   elseif now_fuel ~= P.fuel then
