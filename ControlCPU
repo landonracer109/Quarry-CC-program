@@ -70,7 +70,7 @@ end
 local DEPLOY_PROTOCOL = "chunkdeploy"
 -- Shown on the dashboard, so you can tell whether everything got updated.
 -- c, m and s carry the same number; it goes up with every change.
-local VERSION = "v7"
+local VERSION = "v8"
 
 local REPO = "https://raw.githubusercontent.com/landonracer109/Quarry-CC-program/"
 local FILES = { { "ControlCPU", "c" }, { "ServiceTurtle", "s" }, { "TurtleTest1", "m" } }
@@ -652,6 +652,7 @@ local function do_start()
   end
   started = true
   started_at = os.clock()
+  panel = nil -- (a settings panel left open closes)
   skip = read_progress()
   local lanes = sorted_lanes()
   add_log("control", string.format("Started %d lanes: down to bedrock, %s.",
@@ -682,8 +683,96 @@ local function do_stop()
   for lane in pairs(miners) do tell_stop(lane) end
 end
 
+-- The settings panel (SET): big text and big buttons at the bottom of the
+-- monitor, where you stand. The monitor switches to the largest text that
+-- fits it while it's open.
+local PANEL_W, PANEL_H = 40, 19
+local panel_scaled = false
+
+local function center(text, width)
+  local left = math.floor((width - #text) / 2)
+  return string.rep(" ", left) .. text .. string.rep(" ", width - #text - left)
+end
+
+local function draw_panel(t)
+  if not panel_scaled then
+    for _, sc in ipairs({ 5, 4.5, 4, 3.5, 3, 2.5, 2, 1.5, 1, 0.5 }) do
+      t.setTextScale(sc)
+      local w, h = t.getSize()
+      if w >= PANEL_W and h >= PANEL_H then break end
+    end
+    t.setBackgroundColor(colors.black)
+    t.clear()
+    forget_screen(t)
+    panel_scaled = true
+  end
+  buttons = {}
+  local w, h = t.getSize()
+  local left = string.rep(" ", math.max(0, math.floor((w - PANEL_W) / 2)))
+  local top = math.max(1, h - PANEL_H + 1) -- (at the bottom)
+  local y = 1
+  while y < top do row(t, y, {}) y = y + 1 end
+  local function line(pieces)
+    table.insert(pieces, 1, { left })
+    row(t, y, pieces)
+    y = y + 1
+  end
+  -- a row of 3-line buttons (items with a name) and text (without)
+  local function boxes(items)
+    for l = 0, 2 do
+      local pieces = { { left } }
+      local x = #left + 1
+      for _, it in ipairs(items) do
+        local text = (l == 1) and center(it.label, it.w) or string.rep(" ", it.w)
+        table.insert(pieces, { text, it.fg or colors.white, it.name and (it.bg or colors.gray) or nil })
+        if it.name and l == 0 then
+          table.insert(buttons, { y = y, y2 = y + 2, x1 = x, x2 = x + it.w - 1, name = it.name })
+        end
+        x = x + it.w
+      end
+      row(t, y, pieces)
+      y = y + 1
+    end
+  end
+  local function setting(label, value, key, note)
+    line({ { " " .. label, colors.white } })
+    local gap = { label = "", w = 1 }
+    boxes({
+      { label = "-10", w = 6, name = key .. "-10" }, gap,
+      { label = "-1", w = 5, name = key .. "-1" }, gap,
+      { label = tostring(value), w = 8, fg = colors.yellow }, gap,
+      { label = "+1", w = 5, name = key .. "+1" }, gap,
+      { label = "+10", w = 6, name = key .. "+10" },
+    })
+    line({ { " " .. note, colors.lightGray } })
+    line({})
+  end
+  line({ { center("SETTINGS", PANEL_W), colors.yellow } })
+  line({})
+  setting("Chunks to mine", panel.chunks == 0 and "no limit" or panel.chunks, "c", "0 = no limit")
+  setting("Already mined (driven past)", panel.mined, "m", "0 = start over at chunk 1")
+  boxes({
+    { label = "SAVE", w = 14, name = "save", bg = colors.green },
+    { label = "", w = 4 },
+    { label = "CANCEL", w = 14, name = "cancel", bg = colors.red },
+  })
+  while y <= h do row(t, y, {}) y = y + 1 end
+end
+
 local function draw_monitor()
   local t = mon
+  if panel and not started then
+    draw_panel(t)
+    return
+  end
+  if panel_scaled then -- (back from the panel: the dashboard's text size)
+    panel_scaled = false
+    find_monitor()
+    t = mon
+    t.setBackgroundColor(colors.black)
+    t.clear()
+    forget_screen(t)
+  end
   local w, h = t.getSize()
   local y = 1
 
@@ -728,44 +817,13 @@ local function draw_monitor()
   for _, p in ipairs(right) do total = total + #p[1] end
   local x = w - total + 1
   for _, p in ipairs(right) do
-    if p.name then table.insert(buttons, { y = y, x1 = x, x2 = x + #p[1] - 1, name = p.name }) end
+    if p.name then table.insert(buttons, { y = h, x1 = x, x2 = x + #p[1] - 1, name = p.name }) end
     x = x + #p[1]
   end
-  row(t, y, title, right, colors.gray)
-  y = y + 1
+  -- (the title bar goes on the bottom row, drawn last: nearest to you)
+  local title_row = h
+  h = h - 1
 
-  -- The settings panel (SET) takes the place of everything below.
-  if panel and not started then
-    row(t, y, { { " SETTINGS  (touch - and +, then SAVE)", colors.yellow } })
-    row(t, y + 1, {})
-    y = y + 2
-    local function setting(label, value, key, note)
-      local r = button_row(y)
-      r.text(pad(" " .. label, 22), colors.white)
-      r.button(" -10 ", key .. "-10")
-      r.text(" ")
-      r.button(" -1 ", key .. "-1")
-      r.text("  " .. pad(tostring(value), 5), colors.yellow)
-      r.button(" +1 ", key .. "+1")
-      r.text(" ")
-      r.button(" +10 ", key .. "+10")
-      r.text("  " .. note, colors.lightGray)
-      row(t, y, r.pieces)
-      row(t, y + 1, {})
-      y = y + 2
-    end
-    setting("Chunks to mine", panel.chunks == 0 and "inf" or panel.chunks, "c", "0=no limit")
-    setting("Already mined", panel.mined, "m", "0=restart")
-    local r = button_row(y)
-    r.text(" ")
-    r.button(" SAVE ", "save", colors.green)
-    r.text("   ")
-    r.button(" CANCEL ", "cancel", colors.red)
-    row(t, y, r.pieces)
-    y = y + 1
-    while y <= h do row(t, y, {}) y = y + 1 end
-    return
-  end
 
   -- Settings and overall progress through the current chunk.
   local frac = chunk_progress()
@@ -864,6 +922,7 @@ local function draw_monitor()
     end
     y = y + 1
   end
+  row(t, title_row, title, right, colors.gray)
 end
 
 -- Computer screen (51x19): compact view, same as before plus the latest log.
@@ -1400,7 +1459,7 @@ local function ui_loop()
     elseif e == "monitor_touch" then
       local x, y = ev[3], ev[4]
       for _, b in ipairs(buttons) do
-        if y == b.y and x >= b.x1 and x <= b.x2 then
+        if y >= b.y and y <= (b.y2 or b.y) and x >= b.x1 and x <= b.x2 then
           touched(b.name)
           break
         end
