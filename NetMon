@@ -79,18 +79,38 @@ local function pad(s, n)
   return s .. string.rep(" ", n - #s)
 end
 
+-- "0.19/s": CC 1.63's string.format ignores "%.2f", so round by hand
+local function rate(x)
+  local n = math.floor(x * 100 + 0.5)
+  return string.format("%d.%02d/s", math.floor(n / 100), n % 100)
+end
+
+-- Only lines that changed are written (and nothing is cleared), so a
+-- quiet screen costs next to nothing.
+local shown = {} -- [screen] = { [y] = text .. color }
 local function draw(t)
   local w, h = t.getSize()
   local now = os.clock()
   local sec = math.floor(now)
-  t.setBackgroundColor(colors.black)
-  t.clear()
+  local cache = shown[t]
+  if not cache or cache.w ~= w or cache.h ~= h then
+    t.setBackgroundColor(colors.black)
+    t.clear()
+    cache = { w = w, h = h }
+    shown[t] = cache
+  end
   local y = 1
   local function line(text, color)
     if y > h then return end
-    t.setCursorPos(1, y)
-    if t.isColor() then t.setTextColor(color or colors.white) end
-    t.write(text:sub(1, w))
+    text = pad(text, w)
+    local key = text .. tostring(color)
+    if cache[y] ~= key then
+      cache[y] = key
+      t.setCursorPos(1, y)
+      if t.isColor() then t.setTextColor(color or colors.white) end
+      t.setBackgroundColor(colors.black)
+      t.write(text)
+    end
     y = y + 1
   end
 
@@ -108,9 +128,9 @@ local function draw(t)
   line(" NETWORK MONITOR  (rednet calls heard)", colors.yellow)
   line(" running " .. fmt_time(now - started) .. "   R = reset, Q = quit", colors.gray)
   line("")
-  line(string.format(" last second: %d    last minute: %.2f/s", last_sec, last_min / 60),
+  line(" last second: " .. last_sec .. "    last minute: " .. rate(last_min / 60),
     last_sec > 1 and colors.orange or colors.lime)
-  line(string.format(" last 5 min:  %.2f/s    total: %d", last_5 / span, total))
+  line(" last 5 min:  " .. rate(last_5 / span) .. "    total: " .. total)
   line(string.format(" busiest second: %d%s   seconds >2 (5 min): %d", peak,
     peak_at and ("  (" .. fmt_time(peak_at - started) .. " in)") or "", busy),
     peak > 2 and colors.orange or colors.white)
@@ -147,13 +167,14 @@ local function draw(t)
     local left, right = "", ""
     if froms[i] then
       local id = froms[i][1]
-      left = " " .. pad((names[id] or "?") .. " #" .. id, 18) .. string.format("%5.2f/s", froms[i][2] / span)
+      left = " " .. pad((names[id] or "?") .. " #" .. id, 18) .. rate(froms[i][2] / span)
     end
     if kinds[i] then
-      right = " " .. pad(kinds[i][1], 17) .. string.format("%5.2f/s", kinds[i][2] / span)
+      right = " " .. pad(kinds[i][1], 17) .. rate(kinds[i][2] / span)
     end
     line(pad(left, col) .. right)
   end
+  while y <= h do line("") end -- (clear what's left from before)
 end
 
 local function redraw()
@@ -161,7 +182,8 @@ local function redraw()
   if mon then pcall(draw, mon) end
 end
 
-local timer = os.startTimer(1)
+local REFRESH = 2 -- seconds between redraws
+local timer = os.startTimer(REFRESH)
 redraw()
 while true do
   local ev = { os.pullEvent() }
@@ -184,10 +206,10 @@ while true do
       if s < now - WINDOW then second_counts[s] = nil end
     end
     redraw()
-    timer = os.startTimer(1)
+    timer = os.startTimer(REFRESH)
   elseif ev[1] == "key" then
     if ev[2] == keys.q then break end
-    if ev[2] == keys.r then reset() redraw() end
+    if ev[2] == keys.r then reset() shown = {} redraw() end
   elseif ev[1] == "peripheral" or ev[1] == "peripheral_detach" then
     mon = nil
     for _, name in ipairs(peripheral.getNames()) do
