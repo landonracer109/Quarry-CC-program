@@ -238,9 +238,12 @@ while true do
   elseif ev[1] == "timer" and ev[2] == timer then
     local now = os.clock()
     while events[1] and events[1].t < now - WINDOW do table.remove(events, 1) end
+    -- (collect first, delete after: CC 1.63 can't delete while looping)
+    local old = {}
     for s in pairs(second_counts) do
-      if s < now - WINDOW then second_counts[s] = nil end
+      if s < now - WINDOW then old[#old + 1] = s end
     end
+    for _, s in ipairs(old) do second_counts[s] = nil end
     redraw()
     timer = os.startTimer(REFRESH)
   elseif ev[1] == "key" then
