@@ -70,7 +70,7 @@ end
 local DEPLOY_PROTOCOL = "chunkdeploy"
 -- Shown on the dashboard, so you can tell whether everything got updated.
 -- c, m and s carry the same number; it goes up with every change.
-local VERSION = "v2"
+local VERSION = "v3"
 
 local REPO = "https://raw.githubusercontent.com/landonracer109/Quarry-CC-program/"
 local FILES = { { "ControlCPU", "c" }, { "ServiceTurtle", "s" }, { "TurtleTest1", "m" } }
@@ -134,6 +134,7 @@ local function net_gap_wait()
   last_net_send = os.clock()
 end
 
+-- id = nil: broadcast
 local function queue_send(id, msg, proto)
   for _, q in ipairs(out_queue) do
     if q.id == id and q.proto == proto and q.msg.cmd == msg.cmd and q.msg.role == msg.role then
@@ -142,6 +143,7 @@ local function queue_send(id, msg, proto)
     end
   end
   table.insert(out_queue, { id = id, msg = msg, proto = proto })
+  os.queueEvent("outbox")
 end
 
 local function sender_loop()
@@ -149,9 +151,13 @@ local function sender_loop()
     local q = table.remove(out_queue, 1)
     if q then
       net_gap_wait()
-      rednet.send(q.id, q.msg, q.proto)
+      if q.id then
+        rednet.send(q.id, q.msg, q.proto)
+      else
+        rednet.broadcast(q.msg, q.proto)
+      end
     else
-      sleep(0.25)
+      os.pullEvent("outbox") -- (sleeps until queue_send has something)
     end
   end
 end
@@ -642,15 +648,19 @@ local function do_start()
     miners[lane].status = "starting"
     miners[lane].at_home = nil
     miners[lane].confirmed = nil
+    miners[lane].stop_heard, miners[lane].stop_sent = nil, nil
   end
   save_run()
 end
+
+local tell_stop -- (defined with the fleet control code below)
 
 local function do_stop()
   if not started or stop_requested or finished then return end
   stop_requested = true
   add_log("control", "Stop requested: lanes finish their current pass and go home.")
   save_run()
+  for lane in pairs(miners) do tell_stop(lane) end
 end
 
 local function draw_monitor()
@@ -713,7 +723,7 @@ local function draw_monitor()
   for _, lane in ipairs(lanes) do
     if y > h then break end
     local m = miners[lane]
-    local quiet = m.seen and os.clock() - m.seen > 300 and not all_home
+    local quiet = started and m.seen and os.clock() - m.seen > 300 and not all_home
     pieces = {
       { pad(" " .. lane, 4), colors.white },
       -- "T": this lane throws junk in its trash can
@@ -737,7 +747,7 @@ local function draw_monitor()
   if y <= h then row(t, y, {}) y = y + 1 end
 
   -- Service turtle panel.
-  local quiet = service.seen and os.clock() - service.seen > 120
+  local quiet = started and service.seen and os.clock() - service.seen > 300
   local stock_low = service.stock and service.stock < 16
   local service_rows = {
     {
@@ -827,8 +837,16 @@ end
 
 local last_draw = -math.huge
 local last_draw_error
+local redraw_due = false
 local function draw_all(force)
-  if not force and os.clock() - last_draw < 1 then return end
+  if not force and os.clock() - last_draw < 1 then
+    if not redraw_due then
+      redraw_due = true
+      os.queueEvent("redraw") -- (maintenance_loop draws it a second later)
+    end
+    return
+  end
+  redraw_due = false
   last_draw = os.clock()
   draw_terminal()
   if mon then
@@ -849,8 +867,11 @@ local function send(lane, msg)
   queue_send(miners[lane].id, msg, PROTOCOL)
 end
 
-local function tell_stop(lane)
+-- Re-sent now and then (see maintenance_loop) until the lane says it's
+-- heading home: it may have been restarting when the first one came.
+function tell_stop(lane)
   send(lane, { cmd = "stop", id = lane })
+  miners[lane].stop_sent = os.clock()
   if not stopped[lane] then
     stopped[lane] = true
     miners[lane].status = "stopped, going home"
@@ -1014,21 +1035,6 @@ local function handle(sender, msg)
     else
       m.status = "waiting for " .. waiting[1]
     end
-  elseif msg.cmd == "progress" then
-    m.chunk, m.pass, m.y, m.fuel = msg.chunk, msg.pass, msg.y, msg.fuel
-    m.trash = msg.trash
-    if type(msg.depth) == "number" and msg.depth ~= depth then
-      depth = msg.depth
-      add_log("control", "Bedrock found: mining " .. depth .. " layers deep.")
-      save_run()
-    end
-    -- (after a finished run only a server crash can have a lane still mining:
-    -- the world went back, so let it finish that chunk again)
-    if stop_requested then
-      tell_stop(lane)
-    else
-      m.status = "mining pass " .. tostring(msg.pass)
-    end
   elseif msg.cmd == "chunk_done" then
     if msg.no_next_loader and not last_chunk then
       -- lane 0 couldn't load the next chunk, so nobody may drive into it:
@@ -1060,6 +1066,12 @@ local HOME_STATES = {
   ["stopped, at home"] = true, ["finished"] = true,
 }
 
+-- States that show a lane got its "stop" (no need to send it again).
+local STOP_HEARD = {
+  ["going home"] = true, ["stopped, at home"] = true, ["home, unloading"] = true,
+  ["finished"] = true, ["waiting to collect loaders"] = true, ["collecting loaders"] = true,
+}
+
 -- Status updates from the miners and the service turtle (dashboard only).
 local function handle_status(sender, msg)
   if type(msg) ~= "table" then return end
@@ -1078,7 +1090,19 @@ local function handle_status(sender, msg)
     if m and m.id == sender then
       m.seen = os.clock()
       m.ver = msg.ver or "old"
+      local info = msg.info
+      if type(info) == "table" then
+        m.chunk, m.pass, m.y, m.fuel = info.chunk, info.pass, info.y, info.fuel
+        m.trash = info.trash
+        if type(info.depth) == "number" and info.depth ~= depth then
+          depth = info.depth
+          add_log("control", "Bedrock found: mining " .. depth .. " layers deep.")
+          save_run()
+        end
+      end
+      if msg.state == "working" and m.pass then msg.state = "mining pass " .. m.pass end
       if msg.state then m.status = msg.state end
+      if msg.state and STOP_HEARD[msg.state] then m.stop_heard = true end
       -- on its start spot (all servicing happens there): out of the way
       if msg.state then m.at_home = HOME_STATES[msg.state] or nil end
       if msg.state == "finished" then
@@ -1096,11 +1120,31 @@ local function handle_status(sender, msg)
           m.home = nil
           save_run()
         end
+        -- STOP pressed: it may have missed it while restarting. (After a
+        -- normal finish a crash can put a lane back mid-chunk: it mines
+        -- that chunk again and is told to stop when it reports it done.)
+        m.stop_heard = nil
+        if stop_requested then
+          tell_stop(msg.id)
+        elseif stopped[msg.id] then
+          stopped[msg.id] = nil
+          save_run()
+        end
       end
     end
     for _, text in ipairs(msg.texts or { msg.text }) do
       add_log("lane " .. msg.id, text)
     end
+    -- what else the lane had to tell us rides along with its status
+    if type(msg.hello) == "table" then
+      handle(sender, { cmd = "hello", id = msg.id, version = msg.hello.version, ver = msg.ver,
+        registered = msg.hello.registered })
+    end
+    if type(msg.chunk_done) == "table" then
+      handle(sender, { cmd = "chunk_done", id = msg.id, chunk = msg.chunk_done.chunk,
+        no_next_loader = msg.chunk_done.no_next_loader })
+    end
+    if msg.may_collect then handle(sender, { cmd = "may_collect", id = msg.id }) end
     check_all_home()
   end
 end
@@ -1108,13 +1152,41 @@ end
 -- Main ----------------------------------------------------------------------
 local function network_loop()
   while true do
-    local sender, msg, protocol = rednet.receive(nil, 1)
+    local sender, msg, protocol = rednet.receive() -- (sleeps until one comes)
     if protocol == PROTOCOL then
       handle(sender, msg)
     elseif protocol == STATUS_PROTOCOL then
       handle_status(sender, msg)
     end
     draw_all(false)
+  end
+end
+
+-- Wakes up for a redraw the throttle held back, and otherwise every 15 s:
+-- to refresh the clocks on the dashboard, and to send "stop" again to a
+-- lane that hasn't said it's heading home.
+local function maintenance_loop()
+  local timer = os.startTimer(15)
+  local redraw_timer
+  while true do
+    local ev = { os.pullEvent() }
+    if ev[1] == "redraw" and not redraw_timer then
+      redraw_timer = os.startTimer(1)
+    elseif ev[1] == "timer" and ev[2] == redraw_timer then
+      redraw_timer = nil
+      draw_all(false)
+    elseif ev[1] == "timer" and ev[2] == timer then
+      timer = os.startTimer(started and 15 or 60) -- (between runs: once a minute)
+      if started and (stop_requested or finished) then
+        for lane, m in pairs(miners) do
+          if stopped[lane] and not m.stop_heard and not (m.home and m.confirmed)
+              and os.clock() - (m.stop_sent or 0) >= 120 then
+            tell_stop(lane)
+          end
+        end
+      end
+      draw_all(false)
+    end
   end
 end
 
@@ -1184,7 +1256,10 @@ if not mon then add_log("control", "No monitor found - attach an Advanced Monito
 term.clear()
 forget_screen(term)
 draw_all(true)
-parallel.waitForAny(network_loop, ui_loop, deploy_server, sender_loop)
+-- Turtles keep quiet between runs: ask who's out there (we may have been
+-- restarted on our own, with nobody saying hello since).
+queue_send(nil, { cmd = "who" }, PROTOCOL)
+parallel.waitForAny(network_loop, ui_loop, deploy_server, sender_loop, maintenance_loop)
 draw_all(true)
 
 term.setBackgroundColor(colors.black)

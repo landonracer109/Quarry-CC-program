@@ -34,6 +34,7 @@
 -- comes mid-turn there are just two possibilities: it tries each by
 -- driving home without digging and checking for the fuel chest underneath.
 
+local PROTOCOL = "chunkquarry"          -- (only the control computer's "who")
 local SERVICE_PROTOCOL = "chunkservice" -- miners <-> service turtle
 local STATUS_PROTOCOL = "chunkstatus"   -- status updates for the dashboard
 local DEPLOY_PROTOCOL = "chunkdeploy"   -- program updates from the main computer
@@ -51,7 +52,7 @@ end
 
 -- Shown on the dashboard, so you can tell whether everything got updated.
 -- c, m and s carry the same number; it goes up with every change.
-local VERSION = "v2"
+local VERSION = "v3"
 
 -- Our program's checksum, so the main computer can spot a turtle running an
 -- old version between runs. Only when we were started by the boot loader
@@ -98,7 +99,6 @@ local SELF_FUEL_TARGET = 1000  -- we only drive along the home row
 local SELF_FUEL_MIN = 200      -- below this (and no fuel in the chest) we wait at home
 local MAX_HANDOVER = 64        -- fuel items per visit, at most
 local IDLE_HOME_AFTER = 30  -- seconds with nothing to do before going home
-local HANDSHAKE_TIMEOUT = 60
 local UNBREAKABLE_TRIES = 5
 
 local P -- our position and fuel notes (see Position below)
@@ -135,25 +135,30 @@ end
 
 -- Network -------------------------------------------------------------------
 -- The server allows no more than ONE rednet message per second from each
--- computer, so every message goes through here: at most one per SEND_GAP
--- seconds. Messages that arrive while we wait are kept for net_receive.
+-- computer, so every message goes through net_send / net_broadcast: at
+-- most one per SEND_GAP seconds.
+-- A turtle throws away rednet messages that arrive while it is moving or
+-- digging. So a listener runs beside the program (see the bottom of this
+-- file) and files every message in the inbox: nothing is lost.
 local SEND_GAP = 1
 local last_send = os.clock() -- (as if we had just sent: a message may have gone out just before a reboot)
 local inbox = {}
 local controller_id -- the control computer (the miners tell us which it is)
 
-local function wait_send_gap()
-  local wait = last_send + SEND_GAP - os.clock()
-  if wait > 0 then
-    local timer = os.startTimer(wait)
-    while true do
-      local ev = { os.pullEvent() }
-      if ev[1] == "timer" and ev[2] == timer then break end
-      if ev[1] == "rednet_message" then
-        table.insert(inbox, ev)
-        if #inbox > 20 then table.remove(inbox, 1) end
-      end
+local function listener()
+  while true do
+    local ev = { os.pullEvent("rednet_message") }
+    if ev[4] == SERVICE_PROTOCOL or ev[4] == DEPLOY_PROTOCOL or ev[4] == PROTOCOL then
+      table.insert(inbox, ev)
+      if #inbox > 50 then table.remove(inbox, 1) end
     end
+  end
+end
+
+-- (no yield between the last check and last_send: two senders can't both pass)
+local function wait_send_gap()
+  while os.clock() < last_send + SEND_GAP do
+    sleep(last_send + SEND_GAP - os.clock())
   end
   last_send = os.clock()
 end
@@ -168,27 +173,48 @@ local function net_broadcast(msg, proto)
   rednet.broadcast(msg, proto)
 end
 
--- Like rednet.receive(proto, timeout), but first hands out any message
--- that arrived while we were waiting to send.
-local function net_receive(proto, timeout)
+local function take(proto)
   for i, ev in ipairs(inbox) do
     if proto == nil or ev[4] == proto then
       table.remove(inbox, i)
-      return ev[2], ev[3], ev[4]
+      return ev
     end
   end
-  return rednet.receive(proto, timeout)
+end
+
+-- Like rednet.receive(proto, timeout) (no timeout = wait as long as it
+-- takes), but reads the inbox.
+local function net_receive(proto, timeout)
+  local ev = take(proto)
+  if ev then return ev[2], ev[3], ev[4] end
+  if timeout and timeout <= 0 then return nil end
+  local timer = timeout and os.startTimer(timeout)
+  while true do
+    local e = { os.pullEvent() }
+    if e[1] == "rednet_message" then
+      ev = take(proto) -- (the listener, running first, has filed it)
+      if ev then return ev[2], ev[3], ev[4] end
+    elseif timer and e[1] == "timer" and e[2] == timer then
+      return nil
+    end
+  end
 end
 
 -- Dashboard -----------------------------------------------------------------
--- Status updates for the control computer's display: at most one every
--- STATUS_GAP seconds (log lines in between are bundled), and a heartbeat
--- now and then. A lost update only means a stale display.
+-- Every computer in the quarry has its own second in a CYCLE-second round,
+-- timed by the in-game clock (the same on every computer); ours is second
+-- 0. So the dashboard updates of the whole quarry arrive one at a time.
+-- We only send when something changed, plus a sign of life now and then
+-- while there's work; nothing at all while idle. Only "updating" goes out
+-- at once (we reboot next).
 local queue = {}   -- FIFO of service jobs (see Requests below)
 local status = { state = "starting up", lane = false }
+local CYCLE = 20
+local MY_SLOT = 0
+local KEEPALIVE = 240
+local URGENT = { ["updating"] = true }
 local last_report = -math.huge
-local STATUS_GAP = 5
-local HEARTBEAT = 60
+local last_active = -math.huge -- when we last had a job
 local pending_texts -- log lines not sent yet (nil = nothing new)
 local sent_on_row
 
@@ -198,10 +224,12 @@ local function on_row()
     and not P.recovering
 end
 
-local function flush_report(force)
-  if not pending_texts then return end
-  if not force and os.clock() - last_report < STATUS_GAP then return end
-  local texts = pending_texts
+local function world_seconds()
+  return (os.day() * 24 + os.time()) * 50 -- (an in-game hour is 50 s)
+end
+
+local function send_report()
+  local texts = pending_texts or {}
   pending_texts = nil
   last_report = os.clock()
   sent_on_row = on_row()
@@ -217,16 +245,48 @@ local function flush_report(force)
   end
 end
 
+-- Runs beside the program: wakes up once a round, in our own second.
+local function status_sender()
+  local last_w
+  while true do
+    -- idle with nothing to say: sleep until there is something
+    while not pending_texts and #queue == 0 and os.clock() - last_active >= 600 do
+      os.pullEvent("status_pending")
+    end    local w = world_seconds()
+    local wait
+    if w == last_w then
+      -- the clock stands still (daylight cycle off): our own timing,
+      -- still one slot each (computers booted together have similar clocks)
+      wait = (MY_SLOT - os.clock()) % CYCLE
+    else
+      wait = (MY_SLOT - w) % CYCLE
+    end
+    if wait < 0.5 then wait = wait + CYCLE end -- (just sent in this slot)
+    last_w = w
+    sleep(wait)
+    local busy = #queue > 0 or os.clock() - last_active < 600
+    if pending_texts or (busy and os.clock() - last_report >= KEEPALIVE) then
+      send_report()
+    end
+  end
+end
+
+-- force: send right away
+local function flush_report(force)
+  if force then send_report() end
+end
+
 -- Prints `text` (if given) and passes our current state on to the
--- dashboard (see flush_report). `lane` is the lane we're busy with, or
--- false for none (nil = unchanged).
+-- dashboard. `lane` is the lane we're busy with, or false for none
+-- (nil = unchanged).
 local function report(state, text, lane)
   if state then status.state = state end
   if lane ~= nil then status.lane = lane end
   if text then print(text) end
   pending_texts = pending_texts or {}
   if text then table.insert(pending_texts, text) end
-  flush_report()
+  os.queueEvent("status_pending") -- (wakes status_sender if it's asleep)
+  if state and URGENT[state] then send_report() end
 end
 
 -- Position (saved) ------------------------------------------------------------
@@ -246,7 +306,7 @@ local save_seq = 0
 -- logged moment the world went back to (see rewind below).
 local JOURNAL_FILES = { ".service_log_a", ".service_log_b" }
 local JOURNAL_MAX = 300
-local POS_FIELDS = { "seq", "sx", "sz", "facing", "moving", "turn_to", "fuel" }
+local POS_FIELDS = { "seq", "sx", "sz", "facing", "moving", "turn_to", "fuel", "wt" }
 local journal_file, journal_lines, journal_core
 
 local function journal()
@@ -267,7 +327,7 @@ local function journal()
     line = "S " .. textutils.serialize(P):gsub("\n", " ")
   else
     line = "P " .. P.seq .. " " .. P.sx .. " " .. P.sz .. " " .. P.facing .. " "
-      .. (P.moving or "-") .. " " .. (P.turn_to or "-") .. " " .. P.fuel
+      .. (P.moving or "-") .. " " .. (P.turn_to or "-") .. " " .. P.fuel .. " " .. (P.wt or -1)
   end
   local h = fs.open(journal_file, "a")
   h.writeLine(line)
@@ -298,8 +358,8 @@ local function read_journal()
             table.insert(states, t)
           end
         elseif kind == "P" and cur then
-          local seq, sx, sz, facing, mv, tt, fuel =
-            rest:match("^(%-?%d+) (%-?%d+) (%-?%d+) (%d) (%S+) (%S+) (%-?%d+)$")
+          local seq, sx, sz, facing, mv, tt, fuel, wt =
+            rest:match("^(%-?%d+) (%-?%d+) (%-?%d+) (%d) (%S+) (%S+) (%-?%d+) ?(%-?%d*)$")
           if seq then
             local t = {}
             for k, v in pairs(cur) do t[k] = v end
@@ -307,6 +367,7 @@ local function read_journal()
             t.moving = (mv ~= "-") and mv or nil
             t.turn_to = (tt ~= "-") and tonumber(tt) or nil
             t.fuel = tonumber(fuel)
+            t.wt = tonumber(wt)
             cur = t
             table.insert(states, t)
           end
@@ -323,6 +384,9 @@ local function save()
   save_seq = save_seq + 1
   P.seq = save_seq
   P.fuel = turtle.getFuelLevel()
+  -- the in-game clock: saved with the world, so after a server crash it's
+  -- behind this (see the startup code)
+  P.wt = math.floor(world_seconds())
   local f = fs.open(STATE_FILES[save_seq % 2 + 1], "w")
   f.write(textutils.serialize(P))
   f.close()
@@ -565,8 +629,10 @@ local fuel_measured = false -- fuel per item measured since this boot
 
 -- A restart in the middle of burning leaves our fuel above our notes: this
 -- tells it apart from a server crash (see the startup code).
+-- Until this boot's first burn we don't know what the fuel is (the chest
+-- may have gone from coal to coal blocks): then any amount is fine.
 local function start_burn()
-  P.burning = { per = P.per_item }
+  P.burning = { per = fuel_measured and P.per_item or nil }
   save()
 end
 local function burn_one_fuel()
@@ -668,6 +734,7 @@ local function restock()
     -- (the fuel may have been changed, e.g. from coal to coal blocks)
     if not fuel_measured and fuel_stock() > 1 and burn_one_fuel() then
       fuel_measured = true
+      start_burn() -- (now whole items of it)
     end
     while fuel_level() < SELF_FUEL_TARGET and fuel_stock() > 0 do
       if not burn_one_fuel() then
@@ -745,7 +812,11 @@ local function handle_message(sender, msg)
   reply(sender, "ack", msg)
 end
 
+local drain_requests -- (defined below)
+
 local function serve(job)
+  last_active = os.clock()
+  drain_requests()
   local trip = 2 * (job.id + 1 + job.z) + 20
   -- ("unlimited" fuel comes through as a string: nothing to hand over)
   local handover = type(job.fuel) == "number" and items_for(job.fuel, job.limit) or 0
@@ -784,29 +855,8 @@ local function serve(job)
     return false
   end
 
-  -- Tell the miner we're here; it answers with how many stacks it has.
   report("unloading lane " .. job.id)
-  local start = os.clock()
-  local last_sent = -math.huge
-  local stacks
-  while true do
-    if os.clock() - start > HANDSHAKE_TIMEOUT then
-      report(nil, "Lane " .. job.id .. " never answered, skipping.")
-      return false
-    end
-    if os.clock() - last_sent >= 5 then
-      reply(job.sender, "arrived", job)
-      last_sent = os.clock()
-    end
-    flush_report()
-    local sender, msg = net_receive(SERVICE_PROTOCOL, 1)
-    if type(msg) == "table" and msg.cmd == "ready" and msg.id == job.id
-        and msg.session == job.session and msg.seq == job.seq then
-      stacks = msg.stacks or 0
-      break
-    end
-    handle_message(sender, msg)
-  end
+  local stacks = job.stacks or 0
 
   -- Pull exactly that many stacks out of the miner. Its cargo slots come
   -- before lane 0's chunk loaders (slot 16), and each stack lands in one of
@@ -820,7 +870,18 @@ local function serve(job)
 
   served[job.id] = job.key
   reply(job.sender, "serviced", job)
+  drain_requests()
   return true
+end
+
+-- Answers everything that came in while we were busy (so the miners get
+-- their "ack" and don't need to ask again).
+function drain_requests()
+  while true do
+    local sender, msg = net_receive(SERVICE_PROTOCOL, 0)
+    if not sender then return end
+    handle_message(sender, msg)
+  end
 end
 
 -- Keeps telling the dashboard (the control computer may still be booting
@@ -830,7 +891,7 @@ function stay_lost(text)
   print("the same way as the miners), then run:  " .. PROGRAM .. " here")
   while true do
     report("LOST - move home", text)
-    sleep(30)
+    sleep(60)
   end
 end
 
@@ -838,12 +899,16 @@ end
 -- one whose fuel matches ours now) and carry on from there. Turns cost no
 -- fuel, so if we turned around then, which way we face is checked after.
 -- Returns true if found.
-local function rewind(now_fuel)
+-- now_wt (the in-game clock now): skip saves made later than that.
+local function rewind(now_fuel, now_wt)
   local states = read_journal()
   for i = #states, 1, -1 do
     local st = states[i]
     local pick, facings
-    if st.fuel == now_fuel then
+    local future = now_wt and st.wt and st.wt > now_wt + 3
+    if future then
+      -- (made after the moment the world went back to)
+    elseif st.fuel == now_fuel then
       local j = i
       while j > 1 and states[j - 1].fuel == now_fuel do j = j - 1 end
       pick = states[j]
@@ -880,6 +945,7 @@ local function rewind(now_fuel)
 end
 
 -- Startup -------------------------------------------------------------------
+local function main()
 report("starting up", "Service turtle starting up...")
 local saved = load_state()
 if saved then
@@ -888,9 +954,18 @@ if saved then
   if P.recovering then
     stay_lost("I was restarted while finding my way home and don't know where I am.")
   end
-  -- Do our notes match the world? Every move costs exactly 1 fuel.
+  -- Do our notes match the world? Every move costs exactly 1 fuel. And the
+  -- in-game clock going back means a server crash for sure, even when our
+  -- fuel happens to match. (If nothing in the log fits, someone set the
+  -- time back: carry on.)
   local now_fuel = turtle.getFuelLevel()
-  if type(now_fuel) ~= "number" or type(P.fuel) ~= "number" then
+  local now_wt = math.floor(world_seconds())
+  if type(P.wt) == "number" and now_wt < P.wt - 3 and type(now_fuel) == "number"
+      and rewind(now_fuel, now_wt) then
+    if P.recovering then
+      stay_lost("I was restarted while finding my way home and don't know where I am.")
+    end
+  elseif type(now_fuel) ~= "number" or type(P.fuel) ~= "number" then
     if P.moving then stay_lost("Restarted mid-move with unlimited fuel.") end
   elseif P.moving and now_fuel == P.fuel - 1 then
     track_step(P.moving == "b" and -1 or 1) -- the last step happened
@@ -987,9 +1062,18 @@ while true do
       report("idle at home", nil, false)
       idle_since = os.clock()
     end
-    local sender, msg, protocol = net_receive(nil, 2)
+    -- wait for a message; wake up only to go home after being idle a while
+    local wake
+    if os.clock() - idle_since < IDLE_HOME_AFTER then
+      wake = idle_since + IDLE_HOME_AFTER - os.clock() + 0.1
+    end
+    local sender, msg, protocol = net_receive(nil, wake)
     if protocol == SERVICE_PROTOCOL then
       handle_message(sender, msg)
+    elseif protocol == PROTOCOL and type(msg) == "table" and msg.cmd == "who" then
+      -- the control computer was restarted: tell it where we are
+      controller_id = sender
+      report()
     elseif protocol == DEPLOY_PROTOCOL and type(msg) == "table"
         and msg.cmd == "update_reboot" and #queue == 0 then
       -- the main computer only sends this between runs
@@ -997,9 +1081,12 @@ while true do
       report("updating", "Rebooting to install an update.", false)
       os.reboot()
     end
-    -- heartbeat, or at once when we've reached / left the home row (lane 0
-    -- waits for that before taking the loaders back)
-    if os.clock() - last_report >= HEARTBEAT or on_row() ~= sent_on_row then report() end
-    flush_report()
+    -- when we've reached / left the home row (lane 0 waits for that before
+    -- taking the loaders back)
+    if on_row() ~= sent_on_row then report() end
   end
 end
+end -- main
+
+-- (the listener goes first, so a message is filed before main looks)
+parallel.waitForAny(listener, main, status_sender)
