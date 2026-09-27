@@ -70,7 +70,7 @@ end
 local DEPLOY_PROTOCOL = "chunkdeploy"
 -- Shown on the dashboard, so you can tell whether everything got updated.
 -- c, m and s carry the same number; it goes up with every change.
-local VERSION = "v6"
+local VERSION = "v7"
 
 local REPO = "https://raw.githubusercontent.com/landonracer109/Quarry-CC-program/"
 local FILES = { { "ControlCPU", "c" }, { "ServiceTurtle", "s" }, { "TurtleTest1", "m" } }
@@ -509,7 +509,7 @@ local function run_state()
   if stop_requested then return "STOPPING", colors.orange end
   if last_chunk then return "LAST CHUNK", colors.orange end
   if started then return "RUNNING", colors.lime end
-  return "WAITING FOR START", colors.yellow
+  return "READY", colors.yellow
 end
 
 -- Drawing helpers -------------------------------------------------------------
@@ -606,7 +606,26 @@ end
 
 -- Monitor dashboard -----------------------------------------------------------
 local mon
-local button -- { x1=, x2=, action= } for the touch button in the title bar
+-- Touch buttons on the monitor: { y=, x1=, x2=, name= } (see touched() in
+-- ui_loop). The main computer may sit up a tall tower (radio range), so
+-- everything can be done from the monitor.
+local buttons = {}
+local confirm_update_until = 0
+local panel -- the settings panel while it's open: { chunks=, mined= }
+
+-- Adds a row's pieces one at a time, remembering where buttons are.
+local function button_row(y)
+  local r = { pieces = {}, x = 1 }
+  function r.text(text, fg, bg)
+    table.insert(r.pieces, { text, fg or colors.white, bg })
+    r.x = r.x + #text
+  end
+  function r.button(label, name, bg)
+    table.insert(buttons, { y = y, x1 = r.x, x2 = r.x + #label - 1, name = name })
+    r.text(label, colors.white, bg or colors.gray)
+  end
+  return r
+end
 
 local function find_monitor()
   mon = nil
@@ -672,31 +691,81 @@ local function draw_monitor()
   local state, state_color = run_state()
   local title = {
     { " QUARRY " .. VERSION .. " ", colors.white, colors.blue },
-    { string.format("  Chunk %d/%s   ", current_chunk, chunks == 0 and "inf" or tostring(last_chunk_no())), colors.white },
+    { string.format(" Chunk %d/%s  ", current_chunk, chunks == 0 and "inf" or tostring(last_chunk_no())), colors.white },
     { state, state_color },
   }
-  -- (hours and minutes only: the title isn't redrawn every second)
-  local elapsed = started_at and math.floor((os.clock() - started_at) / 60) or nil
-  local right = { { " " .. (elapsed and string.format("%dh%02dm", math.floor(elapsed / 60), elapsed % 60) or "--:--") .. " ", colors.white } }
-  button = nil
-  local label, bg, action
+  -- buttons on the right: UPD(ate), SET(tings), LOG(s), START / STOP
+  buttons = {}
+  local right = {}
+  if started then
+    -- (hours and minutes only: the title isn't redrawn every second)
+    local elapsed = math.floor((os.clock() - (started_at or os.clock())) / 60)
+    table.insert(right, { string.format(" %dh%02dm ", math.floor(elapsed / 60), elapsed % 60), colors.white })
+  end
+  local function add(label, name, bg) table.insert(right, { label, colors.white, bg, name = name }) end
   if not started then
-    label, bg, action = " START ", colors.green, do_start
+    if os.clock() < confirm_update_until then
+      add(" UPDATE? ", "confirm_update", colors.orange)
+    else
+      add(" UPD ", "update", colors.lightGray)
+    end
+    add(" ", nil, nil)
+    add(" SET ", "settings", colors.lightGray)
+    add(" ", nil, nil)
+  end
+  add(" LOG ", "logs", colors.lightGray)
+  add(" ", nil, nil)
+  if not started then
+    add(" START ", "start", colors.green)
   elseif not stop_requested and not finished then
     if os.clock() < confirm_stop_until then
-      label, bg = " CONFIRM STOP? ", colors.orange
-      action = function() confirm_stop_until = 0; do_stop() end
+      add(" CONFIRM STOP? ", "confirm_stop", colors.orange)
     else
-      label, bg = " STOP ", colors.red
-      action = function() confirm_stop_until = os.clock() + 5 end
+      add(" STOP ", "stop", colors.red)
     end
   end
-  if label then
-    table.insert(right, { label, colors.white, bg })
-    button = { x1 = w - #label + 1, x2 = w, action = action }
+  local total = 0
+  for _, p in ipairs(right) do total = total + #p[1] end
+  local x = w - total + 1
+  for _, p in ipairs(right) do
+    if p.name then table.insert(buttons, { y = y, x1 = x, x2 = x + #p[1] - 1, name = p.name }) end
+    x = x + #p[1]
   end
   row(t, y, title, right, colors.gray)
   y = y + 1
+
+  -- The settings panel (SET) takes the place of everything below.
+  if panel and not started then
+    row(t, y, { { " SETTINGS  (touch - and +, then SAVE)", colors.yellow } })
+    row(t, y + 1, {})
+    y = y + 2
+    local function setting(label, value, key, note)
+      local r = button_row(y)
+      r.text(pad(" " .. label, 22), colors.white)
+      r.button(" -10 ", key .. "-10")
+      r.text(" ")
+      r.button(" -1 ", key .. "-1")
+      r.text("  " .. pad(tostring(value), 5), colors.yellow)
+      r.button(" +1 ", key .. "+1")
+      r.text(" ")
+      r.button(" +10 ", key .. "+10")
+      r.text("  " .. note, colors.lightGray)
+      row(t, y, r.pieces)
+      row(t, y + 1, {})
+      y = y + 2
+    end
+    setting("Chunks to mine", panel.chunks == 0 and "inf" or panel.chunks, "c", "0=no limit")
+    setting("Already mined", panel.mined, "m", "0=restart")
+    local r = button_row(y)
+    r.text(" ")
+    r.button(" SAVE ", "save", colors.green)
+    r.text("   ")
+    r.button(" CANCEL ", "cancel", colors.red)
+    row(t, y, r.pieces)
+    y = y + 1
+    while y <= h do row(t, y, {}) y = y + 1 end
+    return
+  end
 
   -- Settings and overall progress through the current chunk.
   local frac = chunk_progress()
@@ -1242,6 +1311,70 @@ local function maintenance_loop()
   end
 end
 
+local function run_update()
+  add_log("control", "Downloading the newest programs from GitHub...")
+  draw_all(true)
+  local ok, err = download_update()
+  term.clear()
+  forget_screen(term)
+  if not ok then
+    add_log("control", err)
+  elseif started then
+    add_log("control", "Update downloaded: it installs when this run is over.")
+  else
+    add_log("control", "Update downloaded: installing and restarting everything...")
+    draw_all(true)
+    apply_update()
+  end
+end
+
+-- SAVE on the settings panel (same as answering the questions after C).
+local function save_settings()
+  chunks = math.max(0, panel.chunks)
+  write_progress(math.max(0, panel.mined))
+  skip = read_progress()
+  local f = fs.open(SETTINGS_FILE, "w")
+  f.write(length .. "\n0\n" .. chunks .. "\n")
+  f.close()
+  save_run()
+  add_log("control", string.format("Settings saved: %s, %d mined before (driven past).",
+    chunks == 0 and "until stopped" or (chunks .. " chunks"), skip))
+end
+
+local function touched(name)
+  if name == "start" then
+    panel = nil
+    do_start()
+  elseif name == "stop" then
+    confirm_stop_until = os.clock() + 5
+  elseif name == "confirm_stop" then
+    confirm_stop_until = 0
+    do_stop()
+  elseif name == "update" then
+    confirm_update_until = os.clock() + 5
+  elseif name == "confirm_update" then
+    confirm_update_until = 0
+    run_update()
+  elseif name == "logs" then
+    collect_logs()
+  elseif name == "settings" and not started then
+    if panel then
+      panel = nil
+    else
+      panel = { chunks = chunks, mined = read_progress() }
+    end
+  elseif name == "cancel" then
+    panel = nil
+  elseif name == "save" and panel then
+    save_settings()
+    panel = nil
+  elseif panel then
+    local key, amount = name:match("^([cm])([%-%+]%d+)$")
+    if key == "c" then panel.chunks = math.max(0, panel.chunks + tonumber(amount)) end
+    if key == "m" then panel.mined = math.max(0, panel.mined + tonumber(amount)) end
+  end
+end
+
 local function ui_loop()
   while true do
     local ev = { os.pullEvent() }
@@ -1254,20 +1387,7 @@ local function ui_loop()
       elseif ev[2] == keys.q and (not started or all_stopped()) then
         return
       elseif ev[2] == keys.u then
-        add_log("control", "Downloading the newest programs from GitHub...")
-        draw_all(true)
-        local ok, err = download_update()
-        term.clear()
-        forget_screen(term)
-        if not ok then
-          add_log("control", err)
-        elseif started then
-          add_log("control", "Update downloaded: it installs when this run is over.")
-        else
-          add_log("control", "Update downloaded: installing and restarting everything...")
-          draw_all(true)
-          apply_update()
-        end
+        run_update()
       elseif ev[2] == keys.l then
         collect_logs()
       elseif ev[2] == keys.c and not started then
@@ -1279,8 +1399,11 @@ local function ui_loop()
       draw_all(true)
     elseif e == "monitor_touch" then
       local x, y = ev[3], ev[4]
-      if button and y == 1 and x >= button.x1 and x <= button.x2 then
-        button.action()
+      for _, b in ipairs(buttons) do
+        if y == b.y and x >= b.x1 and x <= b.x2 then
+          touched(b.name)
+          break
+        end
       end
       draw_all(true)
     elseif e == "monitor_resize" or e == "peripheral" or e == "peripheral_detach" then
