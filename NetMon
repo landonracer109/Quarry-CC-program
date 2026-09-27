@@ -40,8 +40,10 @@ end
 local events    -- { t=, from=, kind= }, newest last, only the last WINDOW s
 local names     -- [computer id] = "lane 3", "service", "main computer", ...
 local total, started, peak, peak_at, second_counts
+local log -- the last messages, newest last: { t=, from=, to=, kind=, detail= }
+local LOG_MAX = 100
 local function reset()
-  events, names, total, peak, peak_at = {}, {}, 0, 0, nil
+  events, names, total, peak, peak_at, log = {}, {}, 0, 0, nil, {}
   second_counts = {} -- [whole second] = messages in it
   started = os.clock()
 end
@@ -66,6 +68,15 @@ local function describe(from, msg, proto)
     end
   end
   return kind
+end
+
+local function detail_of(msg)
+  if type(msg) ~= "table" then return tostring(msg):sub(1, 40) end
+  if msg.state then return tostring(msg.state) end
+  if type(msg.texts) == "table" and msg.texts[1] then return tostring(msg.texts[1]) end
+  if msg.chunk then return "chunk " .. tostring(msg.chunk) end
+  if msg.id then return "lane " .. tostring(msg.id) end
+  return ""
 end
 
 local function fmt_time(sec)
@@ -162,7 +173,7 @@ local function draw(t)
   local froms, kinds = sorted(by_from), sorted(by_kind)
   local col = math.floor(w / 2)
   line(pad(" BY COMPUTER (5 min)", col) .. " BY KIND (5 min)", colors.yellow)
-  for i = 1, math.max(#froms, #kinds) do
+  for i = 1, math.min(6, math.max(#froms, #kinds)) do
     if y > h then break end
     local left, right = "", ""
     if froms[i] then
@@ -173,6 +184,28 @@ local function draw(t)
       right = " " .. pad(kinds[i][1], 17) .. rate(kinds[i][2] / span)
     end
     line(pad(left, col) .. right)
+  end
+  -- the log: the latest messages, newest at the bottom
+  line("")
+  line(" LOG (newest at the bottom)", colors.yellow)
+  local rows = h - y + 1
+  -- (short, so the detail at the end still fits)
+  local function who(id)
+    if id == 65535 then return "all" end
+    local name = names[id]
+    if name == "main computer" then return "main" end
+    return name or ("#" .. tostring(id))
+  end
+  -- (a wider monitor gets wider name / kind columns)
+  local nw, kw = 9, 12
+  if w >= 70 then nw, kw = 14, 16 end
+  for i = math.max(1, #log - rows + 1), #log do
+    local e = log[i]
+    local sec = math.floor(e.t - started)
+    local stamp = string.format("%d:%02d", math.floor(sec / 60), sec % 60)
+    line(" " .. pad(stamp, 6) .. pad(who(e.from), nw) .. "> " .. pad(who(e.to), nw - 1)
+      .. pad(e.kind, kw) .. " " .. e.detail,
+      names[e.from] and colors.white or colors.lightGray)
   end
   while y <= h do line("") end -- (clear what's left from before)
 end
@@ -194,6 +227,9 @@ while true do
       local from = ev[4] -- (rednet puts the sender's ID as the reply channel)
       local kind = describe(from, packet.message, packet.sProtocol)
       table.insert(events, { t = now, from = from, kind = kind })
+      table.insert(log, { t = now, from = from, to = packet.nRecipient, kind = kind,
+        detail = detail_of(packet.message) })
+      if #log > LOG_MAX then table.remove(log, 1) end
       total = total + 1
       local s = math.floor(now)
       second_counts[s] = (second_counts[s] or 0) + 1
