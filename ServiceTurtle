@@ -52,7 +52,7 @@ end
 
 -- Shown on the dashboard, so you can tell whether everything got updated.
 -- c, m and s carry the same number; it goes up with every change.
-local VERSION = "v3"
+local VERSION = "v4"
 
 -- Our program's checksum, so the main computer can spot a turtle running an
 -- old version between runs. Only when we were started by the boot loader
@@ -148,7 +148,9 @@ local controller_id -- the control computer (the miners tell us which it is)
 local function listener()
   while true do
     local ev = { os.pullEvent("rednet_message") }
-    if ev[4] == SERVICE_PROTOCOL or ev[4] == DEPLOY_PROTOCOL or ev[4] == PROTOCOL then
+    if ev[4] == PROTOCOL and type(ev[3]) == "table" and ev[3].cmd == "upload_log" then
+      os.queueEvent("upload_log") -- (see uploader)
+    elseif ev[4] == SERVICE_PROTOCOL or ev[4] == DEPLOY_PROTOCOL or ev[4] == PROTOCOL then
       table.insert(inbox, ev)
       if #inbox > 50 then table.remove(inbox, 1) end
     end
@@ -276,10 +278,41 @@ local function flush_report(force)
   if force then send_report() end
 end
 
+-- Our own log, for finding out what went wrong: everything we report plus
+-- details the dashboard doesn't show. .service_debug_a is the current file,
+-- .service_debug_b the one before (a new one at every boot and every 300 lines).
+-- To look at it:  edit .service_debug_a      To share it:  pastebin put .service_debug_a
+local DEBUG_FILES = { ".service_debug_a", ".service_debug_b" }
+local debug_lines = 0
+local function rotate_debug()
+  if fs.exists(DEBUG_FILES[1]) then
+    if fs.exists(DEBUG_FILES[2]) then fs.delete(DEBUG_FILES[2]) end
+    fs.move(DEBUG_FILES[1], DEBUG_FILES[2])
+  end
+  debug_lines = 0
+end
+rotate_debug()
+
+local function debug(text)
+  if debug_lines >= 300 then rotate_debug() end
+  local where = P and string.format("x%s z%s f%s q%d", tostring(P.sx), tostring(P.sz),
+    tostring(turtle.getFuelLevel()), #queue) or "-"
+  local line = string.format("%d %s %s %s", os.day(), textutils.formatTime(os.time(), true), where, text)
+  local h = fs.open(DEBUG_FILES[1], "a")
+  if h then
+    h.writeLine(line)
+    h.close()
+    debug_lines = debug_lines + 1
+  end
+end
+
 -- Prints `text` (if given) and passes our current state on to the
 -- dashboard. `lane` is the lane we're busy with, or false for none
 -- (nil = unchanged).
 local function report(state, text, lane)
+  if text or (state and state ~= status.state) then
+    debug((state and ("[" .. state .. "] ") or "") .. (text or ""))
+  end
   if state then status.state = state end
   if lane ~= nil then status.lane = lane end
   if text then print(text) end
@@ -807,6 +840,8 @@ local function handle_message(sender, msg)
       sender = sender, key = key,
     })
     print("Queued lane " .. msg.id)
+    debug("Queued lane " .. msg.id .. ": " .. tostring(msg.stacks) .. " stacks, fuel "
+      .. tostring(msg.fuel))
     report()
   end
   reply(sender, "ack", msg)
@@ -857,6 +892,8 @@ local function serve(job)
 
   report("unloading lane " .. job.id)
   local stacks = job.stacks or 0
+  debug("Lane " .. job.id .. ": pulling " .. stacks .. " stacks (" .. free_cargo_slots()
+    .. " free slots here), handing over " .. handover .. " fuel items")
 
   -- Pull exactly that many stacks out of the miner. Its cargo slots come
   -- before lane 0's chunk loaders (slot 16), and each stack lands in one of
@@ -942,6 +979,47 @@ local function rewind(now_fuel, now_wt)
     end
   end
   return false
+end
+
+-- Uploads text to a paste site (no account needed) and returns its web
+-- address, or nil and why not. (pastebin's old API no longer works.)
+local function upload(text)
+  if not http then return nil, "HTTP is turned off on this server" end
+  local r = http.post("https://paste.rs/", text)
+  if r then
+    local url = (r.readAll() or ""):match("https?://%S+")
+    r.close()
+    if url then return url end
+  end
+  r = http.post("https://dpaste.com/api/v2/",
+    "expiry_days=30&content=" .. textutils.urlEncode(text))
+  if r then
+    local url = (r.readAll() or ""):match("https?://%S+")
+    r.close()
+    if url then return url .. ".txt" end
+  end
+  return nil, "paste.rs and dpaste.com both refused (blocked by the server?)"
+end
+-- Runs beside the program: when the main computer asks (L key), uploads
+-- our log files (older one first) and reports the web address.
+local function uploader()
+  while true do
+    os.pullEvent("upload_log")
+    local text = ""
+    for i = 2, 1, -1 do
+      if fs.exists(DEBUG_FILES[i]) then
+        local h = fs.open(DEBUG_FILES[i], "r")
+        text = text .. "== " .. DEBUG_FILES[i] .. "\n" .. (h.readAll() or "") .. "\n"
+        h.close()
+      end
+    end
+    local url, why = upload(text)
+    if url then
+      report(nil, "Log uploaded: " .. url)
+    else
+      report(nil, "Couldn't upload my log: " .. tostring(why))
+    end
+  end
 end
 
 -- Startup -------------------------------------------------------------------
@@ -1089,4 +1167,4 @@ end
 end -- main
 
 -- (the listener goes first, so a message is filed before main looks)
-parallel.waitForAny(listener, main, status_sender)
+parallel.waitForAny(listener, main, status_sender, uploader)

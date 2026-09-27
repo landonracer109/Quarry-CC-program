@@ -55,7 +55,7 @@ end
 
 -- Shown on the dashboard, so you can tell whether everything got updated.
 -- c, m and s carry the same number; it goes up with every change.
-local VERSION = "v3"
+local VERSION = "v4"
 
 -- Our program's checksum, so the main computer can spot a turtle running an
 -- old version between runs. Only when we were started by the boot loader
@@ -117,7 +117,9 @@ local S -- our saved notes (see Run state below)
 local function listener()
   while true do
     local ev = { os.pullEvent("rednet_message") }
-    if ev[4] == PROTOCOL or ev[4] == SERVICE_PROTOCOL or ev[4] == DEPLOY_PROTOCOL then
+    if ev[4] == PROTOCOL and type(ev[3]) == "table" and ev[3].cmd == "upload_log" then
+      os.queueEvent("upload_log") -- (see uploader)
+    elseif ev[4] == PROTOCOL or ev[4] == SERVICE_PROTOCOL or ev[4] == DEPLOY_PROTOCOL then
       table.insert(inbox, ev)
       if #inbox > 50 then table.remove(inbox, 1) end
     end
@@ -237,10 +239,41 @@ local function flush_status(force)
   if force then send_status() end
 end
 
+-- Our own log, for finding out what went wrong: everything we report plus
+-- details the dashboard doesn't show. .quarry_debug_a is the current file,
+-- .quarry_debug_b the one before (a new one at every boot and every 300 lines).
+-- To look at it:  edit .quarry_debug_a      To share it:  pastebin put .quarry_debug_a
+local DEBUG_FILES = { ".quarry_debug_a", ".quarry_debug_b" }
+local debug_lines = 0
+local function rotate_debug()
+  if fs.exists(DEBUG_FILES[1]) then
+    if fs.exists(DEBUG_FILES[2]) then fs.delete(DEBUG_FILES[2]) end
+    fs.move(DEBUG_FILES[1], DEBUG_FILES[2])
+  end
+  debug_lines = 0
+end
+rotate_debug()
+
+local function debug(text)
+  if debug_lines >= 300 then rotate_debug() end
+  local where = S and string.format("c%s p%s y%s z%s f%s", tostring(S.chunk), tostring(S.pass),
+    tostring(S.y), tostring(S.z), tostring(turtle.getFuelLevel())) or "idle"
+  local line = string.format("%d %s %s %s", os.day(), textutils.formatTime(os.time(), true), where, text)
+  local h = fs.open(DEBUG_FILES[1], "a")
+  if h then
+    h.writeLine(line)
+    h.close()
+    debug_lines = debug_lines + 1
+  end
+end
+
 -- Prints a message and passes it (plus an optional short status) on to the
 -- control computer's dashboard.
 local function say(text, state)
   if text then print(text) end
+  if text or (state and not (status_pending and status_pending.state == state)) then
+    debug((state and ("[" .. state .. "] ") or "") .. (text or ""))
+  end
   status_pending = status_pending or { texts = {} }
   if state then status_pending.state = state end
   if text then table.insert(status_pending.texts, text) end
@@ -394,6 +427,9 @@ end
 -- (the log is kept: after a crash we may not really be home yet; it's
 -- cleared when the next run starts)
 local function clear_state()
+  -- the log's last entry must match us now (no move still marked as
+  -- pending, today's fuel), or the next check takes it for a crash
+  save()
   for _, name in ipairs(STATE_FILES) do fs.delete(name) end
   S = nil
 end
@@ -489,10 +525,16 @@ local function dig_move(dir, move, dig, detect)
       if dig() then
         failed_digs = 0
         digs = digs + 1
-        if digs > 50 then return false end -- endless gravel? give up
+        if digs > 50 then -- endless gravel? give up
+          debug("Gave up moving " .. dir .. ": dug 50 times and still blocked")
+          return false
+        end
       else
         failed_digs = failed_digs + 1
-        if failed_digs >= UNBREAKABLE_TRIES then return false, "bedrock" end
+        if failed_digs >= UNBREAKABLE_TRIES then
+          debug("Can't dig " .. dir .. " (" .. UNBREAKABLE_TRIES .. " tries): taking it as bedrock")
+          return false, "bedrock"
+        end
       end
     else
       warned = wait_for_entity(warned)
@@ -822,8 +864,9 @@ end
 -- `label` is the dashboard status while waiting (repeated now and then:
 -- the control computer may have missed it). If STOP was pressed while we
 -- were home, we stay home: S.stopped is set and the caller winds down.
-local function request_service(label)
+local function request_service(label, why)
   label = label or "waiting for service"
+  if why then say("Heading home: " .. why .. ".") end
   local rz, ry = S.z, S.y
   -- Straight up first: the column above any spot we've visited is already
   -- mined, and so is the whole y=0 row back home.
@@ -918,8 +961,14 @@ local function ensure_ok()
   end
   -- loop: one delivery might not be enough
   while unload or fuel_level() < fuel_needed() or inventory_nearly_full() do
+    local why
+    if fuel_level() < fuel_needed() then
+      why = "fuel " .. fuel_level() .. " < " .. fuel_needed() .. " needed"
+    else
+      why = "unloading, " .. free_cargo_slots() .. " free slots"
+    end
     unload = false
-    request_service()
+    request_service(nil, why)
     if S.stopped then return end
   end
 end
@@ -927,7 +976,7 @@ end
 -- Makes sure we can travel `distance` more blocks along the surface.
 local function ensure_fuel_for(distance)
   while fuel_level() < distance + FUEL_BUFFER do
-    request_service()
+    request_service(nil, "fuel " .. fuel_level() .. " < " .. (distance + FUEL_BUFFER) .. " for the trip")
   end
 end
 
@@ -941,6 +990,7 @@ function check_in()
     if ev[4] == PROTOCOL and ev[2] == S.controller and type(msg) == "table"
         and msg.cmd == "stop" then
       table.remove(inbox, i)
+      debug("Got stop")
       return false
     end
   end
@@ -1158,6 +1208,10 @@ local function mine_chunk()
     if S.stopped then break end
     local ok = do_pass(S.pass)
     if S.stopped then break end
+    if not ok then
+      say("Pass " .. S.pass .. " hit something I can't dig at y=" .. S.y .. ", z=" .. S.z
+        .. ": counting this chunk as done.")
+    end
     S.pass = ok and S.pass + 1 or passes_per_chunk() + 1 -- bedrock: chunk done
     save()
   end
@@ -1464,6 +1518,47 @@ end
 
 -- Run after run: when one ends with us back on the start spot, wait for
 -- the next START. Stop only if we're LOST.
+-- Uploads text to a paste site (no account needed) and returns its web
+-- address, or nil and why not. (pastebin's old API no longer works.)
+local function upload(text)
+  if not http then return nil, "HTTP is turned off on this server" end
+  local r = http.post("https://paste.rs/", text)
+  if r then
+    local url = (r.readAll() or ""):match("https?://%S+")
+    r.close()
+    if url then return url end
+  end
+  r = http.post("https://dpaste.com/api/v2/",
+    "expiry_days=30&content=" .. textutils.urlEncode(text))
+  if r then
+    local url = (r.readAll() or ""):match("https?://%S+")
+    r.close()
+    if url then return url .. ".txt" end
+  end
+  return nil, "paste.rs and dpaste.com both refused (blocked by the server?)"
+end
+-- Runs beside the program: when the main computer asks (L key), uploads
+-- our log files (older one first) and reports the web address.
+local function uploader()
+  while true do
+    os.pullEvent("upload_log")
+    local text = ""
+    for i = 2, 1, -1 do
+      if fs.exists(DEBUG_FILES[i]) then
+        local h = fs.open(DEBUG_FILES[i], "r")
+        text = text .. "== " .. DEBUG_FILES[i] .. "\n" .. (h.readAll() or "") .. "\n"
+        h.close()
+      end
+    end
+    local url, why = upload(text)
+    if url then
+      say("Log uploaded: " .. url)
+    else
+      say("Couldn't upload my log: " .. tostring(why))
+    end
+  end
+end
+
 local function main()
   while start_run() do
     run()
@@ -1471,4 +1566,4 @@ local function main()
   end
 end
 -- (the listener goes first, so a message is filed before main looks)
-parallel.waitForAny(listener, main, status_sender)
+parallel.waitForAny(listener, main, status_sender, uploader)

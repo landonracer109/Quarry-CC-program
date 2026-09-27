@@ -70,7 +70,7 @@ end
 local DEPLOY_PROTOCOL = "chunkdeploy"
 -- Shown on the dashboard, so you can tell whether everything got updated.
 -- c, m and s carry the same number; it goes up with every change.
-local VERSION = "v3"
+local VERSION = "v4"
 
 local REPO = "https://raw.githubusercontent.com/landonracer109/Quarry-CC-program/"
 local FILES = { { "ControlCPU", "c" }, { "ServiceTurtle", "s" }, { "TurtleTest1", "m" } }
@@ -823,13 +823,13 @@ local function draw_terminal()
     last and last.warn and colors.red or colors.lightGray } })
   local help
   if not started then
-    help = "ENTER start U update C settings (" .. #sorted_lanes() .. " ready)"
+    help = "ENTER start U update C settings L logs (" .. #sorted_lanes() .. " ready)"
   elseif all_home then
     help = "Done."
   elseif finished or stop_requested then
     help = "Finishing up... (Q = quit)"
   else
-    help = "S = stop"
+    help = "S = stop   L = upload logs"
   end
   if mon then help = help .. "   [dashboard on monitor]" end
   row(t, h, { { help, colors.yellow } })
@@ -1162,6 +1162,52 @@ local function network_loop()
   end
 end
 
+-- Uploads text to a paste site (no account needed) and returns its web
+-- address, or nil and why not. (pastebin's old API no longer works.)
+local function upload(text)
+  if not http then return nil, "HTTP is turned off on this server" end
+  local r = http.post("https://paste.rs/", text)
+  if r then
+    local url = (r.readAll() or ""):match("https?://%S+")
+    r.close()
+    if url then return url end
+  end
+  r = http.post("https://dpaste.com/api/v2/",
+    "expiry_days=30&content=" .. textutils.urlEncode(text))
+  if r then
+    local url = (r.readAll() or ""):match("https?://%S+")
+    r.close()
+    if url then return url .. ".txt" end
+  end
+  return nil, "paste.rs and dpaste.com both refused (blocked by the server?)"
+end
+
+-- L key: every turtle uploads its own log (they report the web address,
+-- which lands in our log), and a minute later our log goes up too: that
+-- one address has everything.
+local log_timer
+local function collect_logs()
+  -- (one message that every turtle hears)
+  queue_send(nil, { cmd = "upload_log" }, PROTOCOL)
+  add_log("control", "Asked every turtle to upload its log. The full log goes up in a minute...")
+  log_timer = os.startTimer(60)
+end
+
+local function upload_quarry_log()
+  local text = read_file(LOG_FILE) or ""
+  if #text > 150000 then text = "...(older lines left out)\n" .. text:sub(-150000) end
+  local url, why = upload("Quarry log (" .. VERSION .. "), lanes: " .. #sorted_lanes() .. "\n" .. text)
+  if url then
+    add_log("control", "ALL LOGS: " .. url .. "  <- send this address")
+    local h = fs.open("logs_url.txt", "w")
+    h.writeLine(url)
+    h.close()
+  else
+    add_log("control", "Couldn't upload the log: " .. tostring(why))
+  end
+  draw_all(true)
+end
+
 -- Wakes up for a redraw the throttle held back, and otherwise every 15 s:
 -- to refresh the clocks on the dashboard, and to send "stop" again to a
 -- lane that hasn't said it's heading home.
@@ -1172,6 +1218,9 @@ local function maintenance_loop()
     local ev = { os.pullEvent() }
     if ev[1] == "redraw" and not redraw_timer then
       redraw_timer = os.startTimer(1)
+    elseif ev[1] == "timer" and ev[2] == log_timer then
+      log_timer = nil
+      upload_quarry_log()
     elseif ev[1] == "timer" and ev[2] == redraw_timer then
       redraw_timer = nil
       draw_all(false)
@@ -1216,6 +1265,8 @@ local function ui_loop()
           draw_all(true)
           apply_update()
         end
+      elseif ev[2] == keys.l then
+        collect_logs()
       elseif ev[2] == keys.c and not started then
         local h = fs.open(ASK_FILE, "w")
         h.write("ask for the settings on the next boot\n")
