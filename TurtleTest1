@@ -53,6 +53,10 @@ if OPTION == "install" then
   return
 end
 
+-- Shown on the dashboard, so you can tell whether everything got updated.
+-- c, m and s carry the same number; it goes up with every change.
+local VERSION = "v2"
+
 -- Our program's checksum, so the main computer can spot a turtle running an
 -- old version between runs. Only when we were started by the boot loader
 -- (set up with "disk/join"), which fetches the new version when we reboot.
@@ -155,7 +159,7 @@ local function flush_status(force)
   local p = status_pending
   status_pending = nil
   last_status = os.clock()
-  local msg = { cmd = "status", id = LANE, state = p.state, texts = p.texts }
+  local msg = { cmd = "status", id = LANE, state = p.state, texts = p.texts, ver = VERSION }
   local to = controller_id or (S and S.controller)
   if to then
     net_send(to, msg, STATUS_PROTOCOL)
@@ -1174,7 +1178,7 @@ local function register_and_wait()
     -- straight to the control computer and only now and then (it answers
     -- only when it doesn't know us).
     if os.clock() - last_hello >= (registered and 15 or 10) then
-      local hello = { cmd = "hello", id = LANE, version = MY_VERSION, registered = registered }
+      local hello = { cmd = "hello", id = LANE, version = MY_VERSION, ver = VERSION, registered = registered }
       if registered and controller_id then
         net_send(controller_id, hello, PROTOCOL)
       else

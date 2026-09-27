@@ -49,6 +49,10 @@ if OPTION == "install" then
   return
 end
 
+-- Shown on the dashboard, so you can tell whether everything got updated.
+-- c, m and s carry the same number; it goes up with every change.
+local VERSION = "v2"
+
 -- Our program's checksum, so the main computer can spot a turtle running an
 -- old version between runs. Only when we were started by the boot loader
 -- (set up with "disk/join"), which fetches the new version when we reboot.
@@ -204,7 +208,7 @@ local function flush_report(force)
   local msg = {
     cmd = "service", state = status.state, lane = status.lane, texts = texts,
     queue = #queue, fuel = turtle.getFuelLevel(),
-    stock = fuel_stock(), version = MY_VERSION, on_row = sent_on_row,
+    stock = fuel_stock(), version = MY_VERSION, ver = VERSION, on_row = sent_on_row,
   }
   if controller_id then
     net_send(controller_id, msg, STATUS_PROTOCOL)

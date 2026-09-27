@@ -68,6 +68,10 @@ end
 -- staged/ and only moved into live/ between runs, so a turtle that restarts
 -- in the middle of a run always gets the version the run started with.
 local DEPLOY_PROTOCOL = "chunkdeploy"
+-- Shown on the dashboard, so you can tell whether everything got updated.
+-- c, m and s carry the same number; it goes up with every change.
+local VERSION = "v2"
+
 local REPO = "https://raw.githubusercontent.com/landonracer109/Quarry-CC-program/"
 local FILES = { { "ControlCPU", "c" }, { "ServiceTurtle", "s" }, { "TurtleTest1", "m" } }
 local ROLE_PROGRAM = { miner = "m", service = "s" }
@@ -105,6 +109,12 @@ local function live_program(name)
     live_cache[name] = c
   end
   return c
+end
+
+-- The VERSION line of a program we'd hand out (nil: not downloaded yet).
+local function served_version(role)
+  local p = live_program(ROLE_PROGRAM[role])
+  return p and p.text:match('local VERSION = "([^"]+)"') or VERSION
 end
 
 -- Network -------------------------------------------------------------------
@@ -651,7 +661,7 @@ local function draw_monitor()
   -- Title bar with the touch button on the right.
   local state, state_color = run_state()
   local title = {
-    { " QUARRY ", colors.white, colors.blue },
+    { " QUARRY " .. VERSION .. " ", colors.white, colors.blue },
     { string.format("  Chunk %d/%s   ", current_chunk, chunks == 0 and "inf" or tostring(last_chunk_no())), colors.white },
     { state, state_color },
   }
@@ -689,10 +699,11 @@ local function draw_monitor()
 
   -- Lane table.
   local wide = w >= 80
-  local fixed = 6 + 7 + 8 + 6 + 8 + 6 + (wide and 12 or 0)
+  local fixed = 6 + 7 + 8 + 6 + 8 + 6 + 5 + (wide and 12 or 0)
+  local miner_ver = served_version("miner")
   local sw = math.max(10, w - fixed)
   row(t, y, { { pad(" LANE", 6) .. pad("STATUS", sw) .. pad("CHUNK", 7) .. pad("PASS", 8)
-    .. (wide and pad("PROGRESS", 12) or "") .. pad("Y", 6) .. pad("FUEL", 8) .. pad("SEEN", 6), colors.gray } })
+    .. (wide and pad("PROGRESS", 12) or "") .. pad("Y", 6) .. pad("FUEL", 8) .. pad("SEEN", 6) .. "VER", colors.gray } })
   y = y + 1
   local lanes = sorted_lanes()
   if #lanes == 0 then
@@ -718,6 +729,8 @@ local function draw_monitor()
     table.insert(pieces, { pad(m.y or "-", 6), colors.white })
     table.insert(pieces, { pad(m.fuel or "?", 8), colors.white })
     table.insert(pieces, { pad(ago(m.seen), 6), quiet and colors.red or colors.lightGray })
+    -- red: not running the version we'd hand out (it updates between runs)
+    table.insert(pieces, { pad(m.ver or "?", 5), m.ver == miner_ver and colors.lime or colors.red })
     row(t, y, pieces)
     y = y + 1
   end
@@ -737,7 +750,8 @@ local function draw_monitor()
       { "          " },
       { pad("fuel " .. (service.fuel or "?"), 14), colors.white },
       { pad("coal stock " .. (service.stock or "?"), 17), stock_low and colors.red or colors.white },
-      { "seen " .. ago(service.seen), quiet and colors.red or colors.lightGray },
+      { pad("seen " .. ago(service.seen), 12), quiet and colors.red or colors.lightGray },
+      { service.ver or "?", service.ver == served_version("service") and colors.lime or colors.red },
     },
     { { "          last: " .. (service.last_text or "-"), colors.lightGray } },
   }
@@ -777,6 +791,7 @@ local function draw_terminal()
   local w, h = t.getSize()
   local state, state_color = run_state()
   row(t, 1, {
+    { VERSION .. " ", colors.lightBlue },
     { string.format("L=%d D=%s chunk %d/%s ", length, depth_text(), current_chunk,
       chunks == 0 and "inf" or tostring(last_chunk_no())), colors.white },
     { state, state_color },
@@ -946,6 +961,7 @@ local function handle(sender, msg)
 
   if msg.cmd == "hello" then
     nudge_if_outdated(sender, "miner", msg.version, "lane " .. lane)
+    if m and m.id == sender then m.ver = msg.ver or "old" end
     if not started then
       if m and m.id ~= sender then
         add_log("control", "Two turtles claim lane " .. lane .. "! Check their lane numbers.")
@@ -1052,6 +1068,7 @@ local function handle_status(sender, msg)
     service.fuel, service.stock, service.seen = msg.fuel, msg.stock, os.clock()
     service.on_row = msg.on_row
     nudge_if_outdated(sender, "service", msg.version, "the service turtle")
+    service.ver = msg.ver or "old"
     for _, text in ipairs(msg.texts or { msg.text }) do
       service.last_text = text
       add_log("service", text)
@@ -1060,6 +1077,7 @@ local function handle_status(sender, msg)
     local m = miners[msg.id]
     if m and m.id == sender then
       m.seen = os.clock()
+      m.ver = msg.ver or "old"
       if msg.state then m.status = msg.state end
       -- on its start spot (all servicing happens there): out of the way
       if msg.state then m.at_home = HOME_STATES[msg.state] or nil end
