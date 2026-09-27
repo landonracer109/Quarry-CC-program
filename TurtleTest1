@@ -55,7 +55,7 @@ end
 
 -- Shown on the dashboard, so you can tell whether everything got updated.
 -- c, m and s carry the same number; it goes up with every change.
-local VERSION = "v5"
+local VERSION = "v6"
 
 -- Our program's checksum, so the main computer can spot a turtle running an
 -- old version between runs. Only when we were started by the boot loader
@@ -1325,8 +1325,9 @@ local function register_and_wait()
   for i = #inbox, 1, -1 do
     if inbox[i][4] == PROTOCOL then table.remove(inbox, i) end
   end
-  -- (after a run it knows us already: one hello, which it doesn't answer)
-  local registered = controller_id ~= nil
+  -- (every 30 s until it answers: a hello lost out of radio range would
+  -- leave us "not home" and lane 0 waiting for us forever)
+  local registered = false
   local said_hello = false
   local last_hello = -math.huge
   while true do
