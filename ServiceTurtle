@@ -52,7 +52,7 @@ end
 
 -- Shown on the dashboard, so you can tell whether everything got updated.
 -- c, m and s carry the same number; it goes up with every change.
-local VERSION = "v8"
+local VERSION = "v9"
 
 -- Our program's checksum, so the main computer can spot a turtle running an
 -- old version between runs. Only when we were started by the boot loader
@@ -148,7 +148,27 @@ local controller_id -- the control computer (the miners tell us which it is)
 local function listener()
   while true do
     local ev = { os.pullEvent("rednet_message") }
-    if ev[4] == PROTOCOL and type(ev[3]) == "table" and ev[3].cmd == "upload_log" then
+    if ev[4] == PROTOCOL and type(ev[3]) == "table" and ev[3].cmd == "reset" then
+      -- RESET from our main computer (only sent between runs): forget
+      -- everything, like "s here", and start fresh
+      if not controller_id or ev[2] == controller_id then
+        -- a fresh start expects us facing forward, at the block in front
+        -- of home (idle at home we face along the row): turn first
+        if P and P.facing then
+          local diff = P.facing % 4
+          if diff == 1 then turtle.turnLeft()
+          elseif diff == 2 then turtle.turnLeft() turtle.turnLeft()
+          elseif diff == 3 then turtle.turnRight() end
+        end
+        for _, name in ipairs(STATE_FILES) do fs.delete(name) end
+        fs.delete(".service_log_a")
+        fs.delete(".service_log_b")
+        fs.delete(".quarry_away")
+        print("Reset by the main computer: forgot my notes. Restarting...")
+        sleep(1)
+        os.reboot()
+      end
+    elseif ev[4] == PROTOCOL and type(ev[3]) == "table" and ev[3].cmd == "upload_log" then
       os.queueEvent("upload_log") -- (see uploader)
     elseif ev[4] == SERVICE_PROTOCOL or ev[4] == DEPLOY_PROTOCOL or ev[4] == PROTOCOL then
       table.insert(inbox, ev)

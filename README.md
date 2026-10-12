@@ -116,7 +116,7 @@ Dashboard buttons (bottom row of the monitor), or keys on the main computer:
 |---|---|---|
 | START | Enter | start a run (once everyone has registered) |
 | STOP | S | lanes finish their current pass and go home (touch twice) |
-| SET | C | how many chunks to mine, and how many are already done |
+| SET | C | how many chunks to mine, and how many are already done. Also **RESET TURTLES** (touch twice): every turtle forgets its notes, as if you typed `here` on each one, and the next run starts at chunk 1 |
 | UPD | U | download the newest programs from GitHub; they install between runs and every turtle reboots onto them (touch twice) |
 | LOG | L | every turtle uploads its debug log; the main computer shows one link to all of them |
 
@@ -125,6 +125,9 @@ Dashboard buttons (bottom row of the monitor), or keys on the main computer:
   hasn't taken the newest update yet.
 - If a turtle says **LOST**, put it on its start spot and run
   `m <lane> here` (or `s here` for the service turtle).
+- **Moved the quarry, or turtles acting on an old run?** Put every turtle
+  on its start spot and use **SET → RESET TURTLES** instead of typing
+  `here` on each one.
 
 ## Programs
 

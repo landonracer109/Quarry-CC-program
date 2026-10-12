@@ -55,7 +55,7 @@ end
 
 -- Shown on the dashboard, so you can tell whether everything got updated.
 -- c, m and s carry the same number; it goes up with every change.
-local VERSION = "v8"
+local VERSION = "v9"
 
 -- Our program's checksum, so the main computer can spot a turtle running an
 -- old version between runs. Only when we were started by the boot loader
@@ -113,11 +113,25 @@ local inbox = {}
 local controller_id -- the control computer, once it has answered us
 local service_id    -- the service turtle, once it has answered us
 local S -- our saved notes (see Run state below)
+local lost -- (defined further down; also used before that)
 
 local function listener()
   while true do
     local ev = { os.pullEvent("rednet_message") }
-    if ev[4] == PROTOCOL and type(ev[3]) == "table" and ev[3].cmd == "upload_log" then
+    if ev[4] == PROTOCOL and type(ev[3]) == "table" and ev[3].cmd == "reset" then
+      -- RESET from our main computer (only sent between runs): forget
+      -- everything, like "here", and start fresh
+      local boss = controller_id or (S and S.controller)
+      if not boss or ev[2] == boss then
+        for _, name in ipairs(STATE_FILES) do fs.delete(name) end
+        fs.delete(".quarry_away")
+        fs.delete(".quarry_log_a")
+        fs.delete(".quarry_log_b")
+        print("Reset by the main computer: forgot my notes. Restarting...")
+        sleep(1)
+        os.reboot()
+      end
+    elseif ev[4] == PROTOCOL and type(ev[3]) == "table" and ev[3].cmd == "upload_log" then
       os.queueEvent("upload_log") -- (see uploader)
     elseif ev[4] == PROTOCOL or ev[4] == SERVICE_PROTOCOL or ev[4] == DEPLOY_PROTOCOL then
       table.insert(inbox, ev)
@@ -1365,7 +1379,7 @@ end
 
 -- Keeps telling the dashboard (the control computer may still be booting
 -- after a restart), until someone sorts us out by hand.
-local function lost(reason)
+function lost(reason)
   print("Put me back on my start spot, facing the tunnel, then run:")
   print("  " .. PROGRAM .. " " .. LANE .. " here")
   while true do
